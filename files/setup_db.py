@@ -8,8 +8,13 @@ If you ever need to start over, just delete bandflow.db and run this again.
 """
 
 import sqlite3
+import os
+from pathlib import Path
 
-DB_PATH = "bandflow.db"
+DB_PATH = os.environ.get(
+    "BAND_FLOW_DB_PATH",
+    str(Path(__file__).resolve().parents[1] / "bandflow.db"),
+)
 
 
 def setup():
