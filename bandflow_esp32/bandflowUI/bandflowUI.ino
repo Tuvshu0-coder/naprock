@@ -1,5 +1,4 @@
-// BandFlow touchscreen UI prototype. Hardware setup follows lvgl_v8_port.ino;
-// the screens and navigation here are intentionally independent of that UI.
+// I keep this touchscreen prototype independent from lvgl_v8_port.ino.
 
 #include <Arduino_GFX_Library.h>
 #include <lvgl.h>
@@ -34,6 +33,10 @@ static lv_timer_t *completionTimer;
 static lv_timer_t *activeTimer;
 static uint16_t touchX;
 static uint16_t touchY;
+static bool touchWasDown = false;
+static uint16_t touchStartX = 0;
+static uint16_t touchStartY = 0;
+static bool swipeBackRequested = false;
 
 enum ScreenId {
 	SCREEN_TASK_LIST,
@@ -105,8 +108,26 @@ static void readTouch(lv_indev_drv_t *, lv_indev_data_t *data) {
 		data->state = LV_INDEV_STATE_PR;
 		data->point.x = touchX;
 		data->point.y = touchY;
+		if (!touchWasDown) {
+			touchWasDown = true;
+			touchStartX = touchX;
+			touchStartY = touchY;
+			Serial.print("Touch down x=");
+			Serial.print(touchX);
+			Serial.print(" y=");
+			Serial.println(touchY);
+		}
 	} else {
 		data->state = LV_INDEV_STATE_REL;
+		if (touchWasDown) {
+			uint16_t endX = touchX;
+			uint16_t endY = touchY;
+			if (endX > touchStartX + 60 &&
+					abs((int)endY - (int)touchStartY) < 45) {
+				swipeBackRequested = true;
+			}
+			touchWasDown = false;
+		}
 	}
 }
 
@@ -118,7 +139,7 @@ static lv_obj_t *makeLabel(lv_obj_t *parent, const char *text, lv_coord_t x,
 	lv_obj_set_pos(label, x, y);
 	lv_obj_set_size(label, width, height);
 	lv_obj_set_style_text_color(label, color(textColor), 0);
-	lv_obj_set_style_text_font(label, fontSize >= 16 ? &lv_font_montserrat_16 : &lv_font_montserrat_14, 0);
+	lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
 	lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
 	return label;
 }
@@ -132,6 +153,7 @@ static lv_obj_t *makeButton(lv_obj_t *parent, const char *text, lv_coord_t x,
 	lv_obj_set_size(button, width, height);
 	lv_obj_set_style_bg_color(button, color(background), 0);
 	lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
+	lv_obj_set_style_bg_color(button, color(COLOR_SECONDARY), LV_STATE_PRESSED);
 	lv_obj_set_style_radius(button, 8, 0);
 	lv_obj_set_style_border_width(button, 0, 0);
 	lv_obj_set_style_shadow_width(button, 0, 0);
@@ -180,6 +202,13 @@ static void onStartSubtask(lv_event_t *) {
 
 static void onNotYet(lv_event_t *) { }
 
+static void goBack() {
+	if (currentScreen == SCREEN_ACTIVE_SUBTASK) goTo(SCREEN_SUBTASK_DETAILS);
+	else if (currentScreen == SCREEN_SUBTASK_DETAILS ||
+			 currentScreen == SCREEN_PRIORITY_MATRIX) goTo(SCREEN_TASK_LIST);
+	else if (currentScreen == SCREEN_TASK_COMPLETE) goTo(SCREEN_TASK_LIST);
+}
+
 static void onDone(lv_event_t *) {
 	mockTasks[selectedTask].subtasks[selectedSubtask].done = true;
 	mockTasks[selectedTask].progress = (uint8_t)((selectedSubtask + 1) * 33);
@@ -223,20 +252,21 @@ static void drawTaskList() {
 
 	for (uint8_t index = 0; index < taskCount; index++) {
 		lv_obj_t *card = lv_btn_create(list);
-		lv_obj_set_pos(card, 0, index * 43);
-		lv_obj_set_size(card, 296, 38);
+		lv_obj_set_pos(card, 0, index * 48);
+		lv_obj_set_size(card, 296, 43);
 		lv_obj_set_style_bg_color(card, color(COLOR_PANEL), 0);
+		lv_obj_set_style_bg_color(card, color(COLOR_SECONDARY), LV_STATE_PRESSED);
 		lv_obj_set_style_radius(card, 7, 0);
 		lv_obj_set_style_border_width(card, 0, 0);
 		lv_obj_add_event_cb(card, onTaskCard, LV_EVENT_CLICKED, (void *)(uintptr_t)index);
-		makeLabel(card, mockTasks[index].name, 10, 4, 205, 17, COLOR_TEXT, 14);
+		makeLabel(card, mockTasks[index].name, 12, 5, 205, 18, COLOR_TEXT, 14);
 
 		char progressText[8];
 		snprintf(progressText, sizeof(progressText), "%u%%", mockTasks[index].progress);
-		makeLabel(card, progressText, 245, 4, 42, 16, COLOR_MUTED, 12);
+		makeLabel(card, progressText, 245, 5, 42, 16, COLOR_MUTED, 12);
 		lv_obj_t *bar = lv_bar_create(card);
-		lv_obj_set_pos(bar, 10, 25);
-		lv_obj_set_size(bar, 277, 5);
+		lv_obj_set_pos(bar, 12, 29);
+		lv_obj_set_size(bar, 273, 7);
 		lv_obj_set_style_bg_color(bar, color(0x423A76), LV_PART_MAIN);
 		lv_obj_set_style_bg_color(bar, color(COLOR_SECONDARY), LV_PART_INDICATOR);
 		lv_bar_set_value(bar, mockTasks[index].progress, LV_ANIM_OFF);
@@ -256,6 +286,7 @@ static void drawPriorityMatrix() {
 		lv_obj_set_pos(quadrant, 9 + column * 153, 34 + row * 61);
 		lv_obj_set_size(quadrant, 146, 55);
 		lv_obj_set_style_bg_color(quadrant, color(COLOR_PANEL), 0);
+		lv_obj_set_style_bg_color(quadrant, color(COLOR_SECONDARY), LV_STATE_PRESSED);
 		lv_obj_set_style_border_color(quadrant, color(borders[index]), 0);
 		lv_obj_set_style_border_width(quadrant, 1, 0);
 		lv_obj_set_style_radius(quadrant, 7, 0);
@@ -268,16 +299,35 @@ static void drawPriorityMatrix() {
 static void drawSubtaskDetails() {
 	makeButton(screenRoot, "BACK", 10, 6, 58, 23, COLOR_PANEL, [](lv_event_t *) { goTo(SCREEN_TASK_LIST); });
 	makeLabel(screenRoot, mockTasks[selectedTask].name, 78, 8, 225, 20, COLOR_TEXT, 14);
+	lv_obj_t *checklist = lv_obj_create(screenRoot);
+	lv_obj_set_pos(checklist, 8, 31);
+	lv_obj_set_size(checklist, 304, 101);
+	lv_obj_set_style_bg_opa(checklist, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(checklist, 0, 0);
+	lv_obj_set_style_pad_all(checklist, 0, 0);
+	lv_obj_set_scroll_dir(checklist, LV_DIR_VER);
+	lv_obj_set_scrollbar_mode(checklist, LV_SCROLLBAR_MODE_AUTO);
 	for (uint8_t index = 0; index < 3; index++) {
-		lv_obj_t *check = lv_checkbox_create(screenRoot);
+		lv_obj_t *check = lv_checkbox_create(checklist);
 		lv_checkbox_set_text(check, mockTasks[selectedTask].subtasks[index].text);
-		lv_obj_set_pos(check, 13, 31 + index * 24);
-		lv_obj_set_size(check, 294, 22);
+		lv_obj_set_pos(check, 4, index * 36);
+		lv_obj_set_size(check, 290, 32);
+		lv_obj_set_style_pad_column(check, 9, 0);
+		lv_obj_set_style_bg_color(check, color(COLOR_PANEL), 0);
+		lv_obj_set_style_bg_opa(check, LV_OPA_COVER, 0);
+		lv_obj_set_style_radius(check, 6, 0);
+		lv_obj_set_style_pad_left(check, 8, 0);
+		lv_obj_set_style_pad_right(check, 5, 0);
+		lv_obj_set_style_border_width(check, index == selectedSubtask ? 1 : 0, 0);
+		lv_obj_set_style_border_color(check, color(COLOR_SECONDARY), 0);
+		lv_obj_set_style_bg_color(check, color(COLOR_SUCCESS), LV_PART_INDICATOR | LV_STATE_CHECKED);
+		lv_obj_set_style_width(check, 25, LV_PART_INDICATOR);
+		lv_obj_set_style_height(check, 25, LV_PART_INDICATOR);
+		lv_obj_set_style_radius(check, 4, LV_PART_INDICATOR);
 		lv_obj_set_style_text_color(check, index == selectedSubtask ? color(COLOR_TEXT) : color(COLOR_MUTED), 0);
 		if (mockTasks[selectedTask].subtasks[index].done) lv_obj_add_state(check, LV_STATE_CHECKED);
-		lv_obj_clear_flag(check, LV_OBJ_FLAG_CLICKABLE);
 	}
-	makeButton(screenRoot, "START", 75, 139, 170, 25, COLOR_PRIMARY, onStartSubtask);
+	makeButton(screenRoot, "Start", 65, 138, 190, 28, COLOR_PRIMARY, onStartSubtask);
 }
 
 static void drawActiveSubtask() {
@@ -288,8 +338,8 @@ static void drawActiveSubtask() {
 	lv_obj_set_style_text_align(taskText, LV_TEXT_ALIGN_CENTER, 0);
 	timerLabel = makeLabel(screenRoot, "00:00", 0, 76, 320, 22, COLOR_SECONDARY, 16);
 	lv_obj_set_style_text_align(timerLabel, LV_TEXT_ALIGN_CENTER, 0);
-	makeButton(screenRoot, "NOT YET", 12, 121, 142, 37, COLOR_PANEL, onNotYet);
-	makeButton(screenRoot, "DONE", 166, 121, 142, 37, COLOR_SUCCESS, onDone);
+	makeButton(screenRoot, "Not yet", 8, 108, 150, 54, COLOR_PANEL, onNotYet);
+	makeButton(screenRoot, "Done", 162, 108, 150, 54, COLOR_SUCCESS, onDone);
 	activeTimer = lv_timer_create(updateActiveTimer, 1000, nullptr);
 }
 
@@ -297,7 +347,7 @@ static void drawTaskComplete() {
 	lv_obj_t *check = lv_label_create(screenRoot);
 	lv_label_set_text(check, LV_SYMBOL_OK);
 	lv_obj_set_style_text_color(check, color(COLOR_SUCCESS), 0);
-	lv_obj_set_style_text_font(check, &lv_font_montserrat_16, 0);
+	lv_obj_set_style_text_font(check, &lv_font_montserrat_14, 0);
 	lv_obj_align(check, LV_ALIGN_TOP_MID, 0, 21);
 	lv_obj_t *title = makeLabel(screenRoot, "TASK COMPLETE", 0, 57, 320, 20, COLOR_TEXT, 16);
 	lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
@@ -376,5 +426,9 @@ void setup() {
 void loop() {
 	lv_tick_inc(5);
 	lv_timer_handler();
+	if (swipeBackRequested) {
+		swipeBackRequested = false;
+		goBack();
+	}
 	delay(5);
 }

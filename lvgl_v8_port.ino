@@ -624,7 +624,6 @@ Serial.println("SETUP COMPLETE");
 
 void loop() {
 
-  // LVGL runs in lvglTask().
-  // Nothing is needed here.
+  // I leave the loop empty because LVGL runs in lvglTask().
 
 } //beegii the gay
