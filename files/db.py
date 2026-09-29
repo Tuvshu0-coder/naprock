@@ -8,10 +8,17 @@ writing SQL directly — keeps things easy to change later.
 Add more functions here as you need them.
 """
 
+# Legacy prototype helpers only. Production task data is owned by Node; the
+# Flask bridge no longer imports this module.
 import sqlite3
+import os
 from contextlib import contextmanager
+from pathlib import Path
 
-DB_PATH = "bandflow.db"
+DB_PATH = os.environ.get(
+    "BAND_FLOW_DB_PATH",
+    str(Path(__file__).resolve().parents[1] / "bandflow.db"),
+)
 
 
 @contextmanager

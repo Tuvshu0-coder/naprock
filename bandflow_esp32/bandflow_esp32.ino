@@ -7,7 +7,7 @@
 #define SCREEN_WIDTH  320
 #define SCREEN_HEIGHT 170
 #define TFT_BL        38
-
+// hello
 Arduino_DataBus *displayBus = new Arduino_ESP32SPI(
   11,  // DC
   10,  // CS
@@ -185,8 +185,9 @@ void loop() {
   unsigned long now = millis();
   if (now - lastFakeStatusUpdate > FAKE_STATUS_INTERVAL_MS) {
     lastFakeStatusUpdate = now;
-    statusCharacteristic->setValue("TEST");
+    statusCharacteristic->setValue("SERGEI GOMO");
     statusCharacteristic->notify();
-    Serial.println("Sent fake status update: TEST");
+    Serial.println("Sent fake status update: SERGEI GOMO");
   }
 }
+//sergei gomo
