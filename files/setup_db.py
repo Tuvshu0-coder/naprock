@@ -7,6 +7,8 @@ Run this ONCE to create bandflow.db with the tasks/subtasks tables:
 If you ever need to start over, just delete bandflow.db and run this again.
 """
 
+# Legacy prototype setup only. Production task data is owned by Node and this
+# schema is migrated when the Node server starts.
 import sqlite3
 import os
 from pathlib import Path
