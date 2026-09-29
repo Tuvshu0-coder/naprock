@@ -185,8 +185,8 @@ void loop() {
   unsigned long now = millis();
   if (now - lastFakeStatusUpdate > FAKE_STATUS_INTERVAL_MS) {
     lastFakeStatusUpdate = now;
-    statusCharacteristic->setValue("The higher I get the lower I'll sink, I can't drown my demons they now know how to swim");
+    statusCharacteristic->setValue("TEST");
     statusCharacteristic->notify();
-    Serial.println("Sent fake status update: The higher I get the lower I'll sink, I can't drown my demons they know how to swim");
+    Serial.println("Sent fake status update: TEST");
   }
 }
