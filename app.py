@@ -21,13 +21,21 @@ from flask import Flask, jsonify, request
 SERVICE_UUID = "12345678-1234-1234-1234-1234567890ab"
 TASK_CHAR_UUID = "12345678-1234-1234-1234-1234567890ac"
 STATUS_CHAR_UUID = "12345678-1234-1234-1234-1234567890ad"
+# Session channel: the bridge writes replies to RPC_RX and the watch sends requests by notifying RPC_TX.
+# Both carry newline-terminated JSON split into BLE-sized chunks.
+RPC_RX_CHAR_UUID = "12345678-1234-1234-1234-1234567890ae"
+RPC_TX_CHAR_UUID = "12345678-1234-1234-1234-1234567890af"
 TARGET_NAME = "BandFlow-Wristband"
-BRIDGE_API_VERSION = "v1"
+BRIDGE_API_VERSION = "v2"
+SUPPORTED_BRIDGE_VERSIONS = {"v1", "v2"}
 
 SCAN_SECONDS = 15.0
 RECONNECT_DELAY_SECONDS = 5.0
 TASK_WRITE_TIMEOUT_SECONDS = 10.0
 NODE_EVENT_URL = os.environ.get("NODE_EVENT_URL", "http://127.0.0.1:8787/internal/ble/events")
+NODE_RPC_URL = os.environ.get("NODE_RPC_URL", "http://127.0.0.1:8787/internal/band/rpc")
+MAX_CHUNK_BYTES = 180
+MAX_MESSAGE_BYTES = 8192
 INTERNAL_TOKEN = os.environ.get("BLE_INTERNAL_TOKEN", "")
 QUEUE_PATH = Path(os.environ.get("BLE_EVENT_QUEUE_PATH", Path(__file__).resolve().parent / "ble-event-queue.json"))
 STATE_PATH = Path(os.environ.get("BLE_ASSIGNMENT_STATE_PATH", Path(__file__).resolve().parent / "ble-assignment.json"))
@@ -72,6 +80,20 @@ def _post_event(event):
         return False
 
 
+def _node_rpc(band_id, request_body):
+    """Forward one watch request to Node and return its JSON reply."""
+    payload = json.dumps({"band_id": band_id, "request": request_body}).encode("utf-8")
+    headers = {"Content-Type": "application/json", "X-BandFlow-Bridge-Version": BRIDGE_API_VERSION}
+    if INTERNAL_TOKEN:
+        headers["X-BandFlow-Token"] = INTERNAL_TOKEN
+    request_object = urllib.request.Request(NODE_RPC_URL, data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request_object, timeout=8) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return {"ok": False, "error": "The BandFlow server did not answer."}
+
+
 async def _flush_events():
     while True:
         with _state_lock:
@@ -99,7 +121,11 @@ class BandFlowBle:
     def __init__(self):
         self.loop = None
         self.client = None
+        self.address = None
         self._connected = None
+        self._write_lock = None
+        self._rx_buffer = bytearray()
+        self._pending = set()
         self.thread = threading.Thread(target=self._run, name="bandflow-ble", daemon=True)
 
     def start(self):
@@ -138,8 +164,12 @@ class BandFlowBle:
                 self.loop.call_soon_threadsafe(disconnected.set)
 
             try:
-                async with BleakClient(device, disconnected_callback=on_disconnect) as client:
+                # Windows caches a device's services, which would hide characteristics added by new firmware.
+                async with BleakClient(device, disconnected_callback=on_disconnect, winrt={"use_cached_services": False}) as client:
                     self.client = client
+                    self.address = str(device.address).lower()
+                    self._write_lock = asyncio.Lock()
+                    self._rx_buffer = bytearray()
                     self._connected = asyncio.Event()
                     self._connected.set()
 
@@ -153,14 +183,19 @@ class BandFlowBle:
                             self.loop.create_task(self._handle_done())
 
                     await client.start_notify(STATUS_CHAR_UUID, on_status)
+                    await client.start_notify(RPC_TX_CHAR_UUID, self._on_rpc_chunk)
                     print("Connected!")
+                    # The watch waits for this before it asks who is linked.
+                    await self._send_rpc({"t": "hello"})
                     await _flush_events()
                     await disconnected.wait()
                     await client.stop_notify(STATUS_CHAR_UUID)
+                    await client.stop_notify(RPC_TX_CHAR_UUID)
             except Exception as error:
                 print(f"BLE connection error: {error}; retrying...")
             finally:
                 self.client = None
+                self.address = None
                 self._connected = None
             await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
@@ -181,13 +216,62 @@ class BandFlowBle:
         _queue_event(event)
         await _flush_events()
 
+    def _on_rpc_chunk(self, _, data):
+        self._rx_buffer.extend(data)
+        if len(self._rx_buffer) > MAX_MESSAGE_BYTES:
+            print("Dropping an oversized message from the band")
+            self._rx_buffer.clear()
+            return
+        while b"\n" in self._rx_buffer:
+            line, _, rest = bytes(self._rx_buffer).partition(b"\n")
+            self._rx_buffer = bytearray(rest)
+            if line.strip():
+                task = self.loop.create_task(self._handle_band_message(line))
+                self._pending.add(task)
+                task.add_done_callback(self._pending.discard)
+
+    async def _handle_band_message(self, line):
+        try:
+            message = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            print(f"Ignoring a malformed message from the band: {line[:80]!r}")
+            return
+        if not isinstance(message, dict) or not isinstance(message.get("t"), str):
+            return
+        request_id = message.pop("id", None)
+        address = self.address
+        if address is None:
+            return
+        reply = await asyncio.to_thread(_node_rpc, address, message)
+        if request_id is not None:
+            reply["id"] = request_id
+        print(f"Band request {message.get('t')} -> ok={reply.get('ok')}")
+        try:
+            await self._send_rpc(reply)
+        except Exception as error:
+            print(f"Could not answer the band: {error}")
+
+    async def _write_task(self, data):
+        # One GATT write at a time, so chunks of two messages never interleave.
+        async with self._write_lock:
+            await self.client.write_gatt_char(TASK_CHAR_UUID, data, response=True)
+
+    async def _send_rpc(self, message):
+        if self.client is None or not self.client.is_connected:
+            raise RuntimeError("BandFlow is not connected")
+        data = (json.dumps(message, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+        size = max(20, min(MAX_CHUNK_BYTES, (self.client.mtu_size or 23) - 3))
+        async with self._write_lock:
+            for start in range(0, len(data), size):
+                await self.client.write_gatt_char(RPC_RX_CHAR_UUID, data[start:start + size], response=True)
+
     async def send_task(self, text):
         if self._connected is None:
             raise RuntimeError("BandFlow is not connected")
         await asyncio.wait_for(self._connected.wait(), timeout=TASK_WRITE_TIMEOUT_SECONDS)
         if self.client is None or not self.client.is_connected:
             raise RuntimeError("BandFlow is not connected")
-        await self.client.write_gatt_char(TASK_CHAR_UUID, text.encode("utf-8"), response=True)
+        await self._write_task(text.encode("utf-8"))
 
 
 ble_manager = BandFlowBle()
@@ -220,6 +304,7 @@ def bridge_health():
         status="ok",
         bridge_api_version=BRIDGE_API_VERSION,
         connected=bool(ble_manager._connected),
+        band_id=ble_manager.address,
         queued_events=queued_count,
     )
 
@@ -246,14 +331,21 @@ def dispatch():
     if not _require_internal():
         return jsonify(error="Internal token required"), 401
     requested_version = request.headers.get("X-BandFlow-Bridge-Version")
-    if requested_version and requested_version != BRIDGE_API_VERSION:
-        return jsonify(error=f"Unsupported bridge contract {requested_version}; expected {BRIDGE_API_VERSION}"), 426
+    if requested_version and requested_version not in SUPPORTED_BRIDGE_VERSIONS:
+        return jsonify(error=f"Unsupported bridge contract {requested_version}; expected one of {sorted(SUPPORTED_BRIDGE_VERSIONS)}"), 426
     body = request.get_json(silent=True) or {}
     task_id = body.get("task_id")
     subtask_id = body.get("subtask_id")
     text = body.get("text")
     if not all(isinstance(value, str) and value.strip() for value in (task_id, subtask_id, text)):
         return jsonify(error="task_id, subtask_id, and non-empty text are required"), 400
+    band_id = body.get("band_id")
+    if isinstance(band_id, str) and band_id.strip():
+        connected_band = ble_manager.address
+        if connected_band is None:
+            return jsonify(error="BandFlow is not connected"), 503
+        if band_id.strip().lower() != connected_band:
+            return jsonify(error="The wristband linked to this worker is not the one connected to this bridge."), 409
     assignment = {"task_id": task_id, "subtask_id": subtask_id, "text": text.strip()}
     with _state_lock:
         _current_assignment = assignment
