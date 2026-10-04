@@ -13,12 +13,24 @@
 #include <lvgl.h>
 #include <ArduinoJson.h>
 #include <string>
+#include <esp_adc/adc_continuous.h>
 #include "touch.h"
+#include "adpcm.h"
 
 #define SCREEN_WIDTH  320
 #define SCREEN_HEIGHT 170
 #define TFT_BL        38
 // hello hello hello
+
+// Vibration motor: switch it through a transistor (or driver board), never straight from the pin.
+#define VIBRATION_PIN          16
+#define VIBRATION_ACTIVE_LEVEL HIGH  // use LOW if your driver turns the motor on when the pin goes low
+
+// Microphone: the signal must go to an ADC1 pin (GPIO 1-10). GPIO 45 has no ADC, and 1, 3, 8, 9, 10 are
+// already used by the display and touch panel, so this leaves 2, 4, 5, 6 or 7.
+#define MIC_PIN                4
+#define MIC_SAMPLE_RATE        8000
+#define MIC_MIN_PEAK           12  // quietest usable speech peak, in 12-bit ADC counts after removing the DC level
 
 // These match the worker screens in the app (WorkerDashboard.tsx / TaskDetail.tsx, dark theme).
 #define COLOR_BG            0x07111F
@@ -67,10 +79,12 @@
 #define STATUS_CHAR_UUID     "12345678-1234-1234-1234-1234567890ad"
 #define RPC_RX_CHAR_UUID     "12345678-1234-1234-1234-1234567890ae"  // bridge writes replies here
 #define RPC_TX_CHAR_UUID     "12345678-1234-1234-1234-1234567890af"  // watch notifies requests here
+#define AUDIO_TX_CHAR_UUID   "12345678-1234-1234-1234-1234567890b0"  // watch notifies voice recordings here
 
 NimBLECharacteristic *taskCharacteristic;
 NimBLECharacteristic *statusCharacteristic;
 NimBLECharacteristic *rpcTxCharacteristic;
+NimBLECharacteristic *audioTxCharacteristic;
 
 Arduino_DataBus *displayBus = new Arduino_ESP32SPI(
   11,  // DC
@@ -118,16 +132,20 @@ static uint8_t rxLineCount = 0;
 
 // ---- UI model --------------------------------------------------------------------------------
 
-enum RpcKind { RPC_NONE, RPC_STATUS, RPC_PAIR, RPC_LINK_STATUS, RPC_MATRIX, RPC_WORKS, RPC_SUBTASKS, RPC_REMOVE, RPC_UNLINK };
+enum RpcKind { RPC_NONE, RPC_STATUS, RPC_PAIR, RPC_LINK_STATUS, RPC_MATRIX, RPC_WORKS, RPC_SUBTASKS, RPC_REMOVE, RPC_ADD, RPC_UNLINK };
 enum Screen { SCR_CONNECTING, SCR_PAIRING, SCR_MATRIX, SCR_WORKS, SCR_SUBTASKS, SCR_STEP };
 enum LinkState { LINK_UNKNOWN, LINK_UNPAIRED, LINK_PAIRED };
 enum StepMode { STEP_NONE, STEP_ACTIVE, STEP_SENT };
 enum LoadState { LOAD_LOADING, LOAD_READY, LOAD_ERROR };
-enum ModalKind { MODAL_NONE, MODAL_TASK, MODAL_TASK_CONFIRM, MODAL_BUSY, MODAL_ERROR, MODAL_ACCOUNT, MODAL_ACCOUNT_CONFIRM };
+enum ModalKind {
+  MODAL_NONE, MODAL_TASK, MODAL_TASK_CONFIRM, MODAL_BUSY, MODAL_ERROR, MODAL_ACCOUNT, MODAL_ACCOUNT_CONFIRM,
+  MODAL_RECORDING, MODAL_VOICE_SENDING, MODAL_VOICE_CONFIRM
+};
+enum VoicePhase { VOICE_IDLE, VOICE_RECORDING, VOICE_SENDING, VOICE_WAITING };
 enum Action {
   ACT_NONE, ACT_BACK, ACT_OPEN_CAT, ACT_OPEN_WORK, ACT_OPEN_TASK, ACT_OPEN_STEP, ACT_DONE, ACT_RETRY,
   ACT_MODAL_CLOSE, ACT_TASK_REMOVE_ASK, ACT_TASK_REMOVE_YES, ACT_ACCOUNT_OPEN, ACT_ACCOUNT_UNLINK_ASK,
-  ACT_ACCOUNT_UNLINK_YES
+  ACT_ACCOUNT_UNLINK_YES, ACT_VOICE_ADD, ACT_VOICE_STOP, ACT_VOICE_CANCEL, ACT_VOICE_CONFIRM
 };
 
 // Quadrant order is the on-screen order: urgent column first, important row first.
@@ -151,7 +169,7 @@ struct TaskRow {
 };
 
 static const uint8_t MAX_WORKS = 12;
-static const uint8_t MAX_TASKS = 16;
+static const uint8_t MAX_TASKS = 24;  // the server allows at most 24 tasks per work
 
 static Screen screen = SCR_CONNECTING;
 static LinkState linkState = LINK_UNKNOWN;
@@ -182,6 +200,43 @@ static uint32_t sentAt = 0;
 
 static ModalKind modal = MODAL_NONE;
 static char modalError[96] = "";
+static lv_obj_t *modalBodyLabel = nullptr;  // text updated while a dialog is open (recording time, sending progress)
+static lv_obj_t *modalLevelBar = nullptr;   // live microphone level in the recording dialog
+static bool scrollToLast = false;           // after adding a task, show it at the bottom of the list
+
+// Vibration motor
+static const uint16_t *hapticPattern = nullptr;
+static uint8_t hapticLength = 0;
+static uint8_t hapticIndex = 0;
+static uint32_t hapticNextAt = 0;
+
+// Microphone capture runs in its own task so the screen never makes it drop samples.
+static bool micAvailable = false;
+static adc_unit_t micUnit = ADC_UNIT_1;
+static adc_channel_t micChannel = ADC_CHANNEL_0;
+static adc_continuous_handle_t adcHandle = nullptr;
+static int16_t *recBuffer = nullptr;
+static size_t recCapacity = 0;
+static volatile size_t recCount = 0;
+static volatile bool recRunning = false;
+static volatile bool recStopRequested = false;
+static volatile uint16_t recLevel = 0;  // peak-to-peak counts over the last 100 ms, for the level meter
+
+// Voice-add flow: record -> compress -> send -> bridge transcribes -> confirm -> add
+static VoicePhase voicePhase = VOICE_IDLE;
+static uint8_t *voiceAdpcm = nullptr;
+static size_t voiceAdpcmBytes = 0;
+static size_t voiceSamples = 0;
+static AdpcmState voiceStart = {0, 0};
+static uint8_t voiceSid = 0;
+static uint8_t voiceStage = 0;  // 0 start packet, 1 data, 2 end packet, 3 done
+static size_t voiceOffset = 0;
+static uint16_t voiceSeq = 0;
+static uint8_t voiceLastPercent = 255;
+static uint32_t voiceProgressAt = 0;
+static uint32_t voiceWaitSince = 0;
+static uint32_t voiceUiAt = 0;
+static char voiceText[124] = "";
 
 static bool shownConnected = false;
 static bool uiDirty = true;
@@ -242,7 +297,7 @@ static bool startRpc(RpcKind kind, const char *type, const char *key1 = nullptr,
   doc["t"] = type;
   if (key1 != nullptr) doc[key1] = value1;
   if (key2 != nullptr) doc[key2] = value2;
-  char line[256];
+  char line[384];
   size_t length = serializeJson(doc, line, sizeof(line) - 1);
   line[length++] = '\n';
   pendingKind = kind;
@@ -423,7 +478,8 @@ static void drawTopBar(const char *title, lv_coord_t titleWidth, bool back) {
     for (uint8_t index = 0; index < taskCount; index++) done += tasks[index].state == 'd';
     char progress[12];
     snprintf(progress, sizeof(progress), "%u/%u", done, taskCount);
-    addChip(bar, progress, -36, 54, COLOR_ACCENT, ACT_NONE);
+    addChip(bar, progress, -74, 54, COLOR_ACCENT, ACT_NONE);
+    addChip(bar, LV_SYMBOL_PLUS, -36, 30, COLOR_SUCCESS, ACT_VOICE_ADD);
   } else if (screen == SCR_STEP && stepMode == STEP_ACTIVE) {
     lv_obj_t *chip = addChip(bar, "00:00", -36, 62, COLOR_ACCENT, ACT_NONE);
     timerLabel = lv_obj_get_child(chip, 0);
@@ -648,7 +704,8 @@ static void drawStep() {
 
 static lv_obj_t *modalButton(lv_obj_t *card, const char *text, Action action, bool filled, uint32_t accent, lv_coord_t x,
                              lv_coord_t width) {
-  lv_obj_t *button = makeButton(card, width, 34, filled ? accent : COLOR_SURFACE, filled ? COLOR_DANGER_PRESS : COLOR_SURFACE_PRESS, 10, action);
+  uint32_t pressed = !filled ? COLOR_SURFACE_PRESS : accent == COLOR_SUCCESS ? COLOR_SUCCESS_PRESS : COLOR_DANGER_PRESS;
+  lv_obj_t *button = makeButton(card, width, 34, filled ? accent : COLOR_SURFACE, pressed, 10, action);
   lv_obj_align(button, LV_ALIGN_BOTTOM_LEFT, x, 0);
   if (!filled) {
     lv_obj_set_style_border_color(button, color(accent), 0);
@@ -673,6 +730,7 @@ static void drawModal() {
   const char *rightText = nullptr;
   Action rightAction = ACT_NONE;
   bool rightFilled = false;
+  uint32_t rightColor = COLOR_DANGER;
   const TaskRow &task = tasks[selectedTask < MAX_TASKS ? selectedTask : 0];
 
   switch (modal) {
@@ -718,11 +776,40 @@ static void drawModal() {
       rightAction = ACT_ACCOUNT_UNLINK_YES;
       rightFilled = true;
       break;
+    case MODAL_RECORDING:
+      caption = "LISTENING";
+      captionColor = COLOR_DANGER;
+      body = "Say the new task";
+      leftText = "Cancel";
+      leftAction = ACT_VOICE_CANCEL;
+      rightText = "Done";
+      rightAction = ACT_VOICE_STOP;
+      rightFilled = true;
+      rightColor = COLOR_SUCCESS;
+      break;
+    case MODAL_VOICE_SENDING:
+      caption = voicePhase == VOICE_WAITING ? "UNDERSTANDING" : "SENDING";
+      body = voicePhase == VOICE_WAITING ? "Working out what you said..." : "Sending your voice...";
+      leftText = "Cancel";
+      leftAction = ACT_VOICE_CANCEL;
+      break;
+    case MODAL_VOICE_CONFIRM:
+      caption = "ADD THIS TASK?";
+      captionColor = COLOR_SUCCESS;
+      body = voiceText;
+      leftText = "Discard";
+      leftAction = ACT_VOICE_CANCEL;
+      rightText = "Add";
+      rightAction = ACT_VOICE_CONFIRM;
+      rightFilled = true;
+      rightColor = COLOR_SUCCESS;
+      break;
     default:
       return;
   }
 
-  lv_coord_t bodyHeight = lv_font_get_line_height(FONT_STEP) * 3;
+  lv_coord_t lineHeight = lv_font_get_line_height(FONT_STEP);
+  lv_coord_t bodyHeight = lineHeight * 3;
   lv_obj_t *card = lv_obj_create(modalRoot);
   lv_obj_set_size(card, 280, 10 + 17 + 4 + bodyHeight + 8 + 34 + 10);
   lv_obj_center(card);
@@ -740,12 +827,28 @@ static void drawModal() {
   lv_obj_align(captionLabel, LV_ALIGN_TOP_LEFT, 0, 0);
   lv_obj_t *bodyLabel = makeLabel(card, body, COLOR_TITLE, FONT_STEP);
   lv_label_set_long_mode(bodyLabel, LV_LABEL_LONG_DOT);
-  lv_obj_set_size(bodyLabel, 258, bodyHeight);
+  lv_obj_set_size(bodyLabel, 258, modal == MODAL_RECORDING ? lineHeight : bodyHeight);
   lv_obj_align(bodyLabel, LV_ALIGN_TOP_LEFT, 0, 21);
+  modalBodyLabel = bodyLabel;
+
+  if (modal == MODAL_RECORDING) {
+    // A live level meter shows right away whether the microphone is hearing anything.
+    lv_obj_t *bar = lv_bar_create(card);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(bar, 258, 10);
+    lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 21 + lineHeight + 8);
+    lv_obj_set_style_bg_color(bar, color(COLOR_TRACK), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, color(COLOR_SUCCESS), LV_PART_INDICATOR);
+    lv_bar_set_value(bar, 0, LV_ANIM_OFF);
+    modalLevelBar = bar;
+    lv_obj_t *elapsed = makeLabel(card, "0:00", COLOR_BODY);
+    lv_obj_align(elapsed, LV_ALIGN_TOP_LEFT, 0, 21 + lineHeight + 8 + 10 + 4);
+    modalBodyLabel = elapsed;
+  }
 
   if (leftText != nullptr && rightText != nullptr) {
     modalButton(card, leftText, leftAction, false, COLOR_BODY, 0, 124);
-    modalButton(card, rightText, rightAction, rightFilled, COLOR_DANGER, 134, 124);
+    modalButton(card, rightText, rightAction, rightFilled, rightColor, 134, 124);
   } else if (leftText != nullptr) {
     modalButton(card, leftText, leftAction, false, COLOR_BODY, 0, 258);
   }
@@ -756,8 +859,424 @@ static void showModal(ModalKind kind) {
     lv_obj_del(modalRoot);
     modalRoot = nullptr;
   }
+  modalBodyLabel = nullptr;
+  modalLevelBar = nullptr;
   modal = kind;
   if (kind != MODAL_NONE) drawModal();
+}
+
+// ---- Vibration motor ------------------------------------------------------------------------------------------
+
+// Patterns alternate on, off, on... in milliseconds.
+static const uint16_t PATTERN_BOOT[] = {120};
+static const uint16_t PATTERN_NEW_STEP[] = {350};
+static const uint16_t PATTERN_STEP_DONE[] = {80, 90, 80};
+#define VIBRATE(pattern) vibrate(pattern, sizeof(pattern) / sizeof(pattern[0]))
+
+static void motorWrite(bool on) {
+  bool high = on ? (VIBRATION_ACTIVE_LEVEL == HIGH) : (VIBRATION_ACTIVE_LEVEL != HIGH);
+  digitalWrite(VIBRATION_PIN, high ? HIGH : LOW);
+}
+
+static void vibrate(const uint16_t *pattern, uint8_t length) {
+  hapticPattern = pattern;
+  hapticLength = length;
+  hapticIndex = 0;
+  hapticNextAt = millis() + pattern[0];
+  motorWrite(true);
+}
+
+// Steps the pattern along without blocking, so the screen and Bluetooth keep running while the motor buzzes.
+static void runHaptics() {
+  if (hapticPattern == nullptr || (int32_t)(millis() - hapticNextAt) < 0) return;
+  hapticIndex++;
+  if (hapticIndex >= hapticLength) {
+    motorWrite(false);
+    hapticPattern = nullptr;
+    return;
+  }
+  motorWrite(hapticIndex % 2 == 0);
+  hapticNextAt += hapticPattern[hapticIndex];
+}
+
+// ---- Microphone -------------------------------------------------------------------------------------------------
+
+static bool adcOpen() {
+  adc_continuous_handle_cfg_t handleConfig = {};
+  handleConfig.max_store_buf_size = 4096;
+  handleConfig.conv_frame_size = 256;
+  if (adc_continuous_new_handle(&handleConfig, &adcHandle) != ESP_OK) return false;
+
+  adc_digi_pattern_config_t pattern = {};
+  pattern.atten = ADC_ATTEN_DB_12;
+  pattern.channel = micChannel;
+  pattern.unit = micUnit;
+  pattern.bit_width = ADC_BITWIDTH_12;
+  adc_continuous_config_t config = {};
+  config.pattern_num = 1;
+  config.adc_pattern = &pattern;
+  config.sample_freq_hz = MIC_SAMPLE_RATE;
+  config.conv_mode = ADC_CONV_SINGLE_UNIT_1;
+  config.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
+  if (adc_continuous_config(adcHandle, &config) != ESP_OK || adc_continuous_start(adcHandle) != ESP_OK) {
+    adc_continuous_deinit(adcHandle);
+    adcHandle = nullptr;
+    return false;
+  }
+  return true;
+}
+
+static void adcClose() {
+  if (adcHandle == nullptr) return;
+  adc_continuous_stop(adcHandle);
+  adc_continuous_deinit(adcHandle);
+  adcHandle = nullptr;
+}
+
+// Reads one DMA frame (up to 64 samples) and returns how many 12-bit samples were stored.
+static size_t adcReadSamples(int16_t *out, size_t maxCount, uint32_t timeoutMs) {
+  uint8_t raw[256];
+  uint32_t received = 0;
+  if (adc_continuous_read(adcHandle, raw, sizeof(raw), &received, timeoutMs) != ESP_OK) return 0;
+  size_t count = 0;
+  for (uint32_t offset = 0; offset + SOC_ADC_DIGI_RESULT_BYTES <= received && count < maxCount; offset += SOC_ADC_DIGI_RESULT_BYTES) {
+    adc_digi_output_data_t *sample = (adc_digi_output_data_t *)&raw[offset];
+    if (sample->type2.channel != micChannel) continue;
+    out[count++] = (int16_t)sample->type2.data;
+  }
+  return count;
+}
+
+// Listens for half a second at start-up and prints whether the microphone circuit is wired sensibly.
+static void micSelfTest() {
+  if (!adcOpen()) {
+    Serial.println("Microphone check: the ADC could not be started");
+    micAvailable = false;
+    return;
+  }
+  int16_t samples[64];
+  uint32_t startedAt = millis();
+  size_t seen = 0;
+  size_t counted = 0;
+  int32_t minimum = 4095;
+  int32_t maximum = 0;
+  double sum = 0;
+  while (counted < 4000 && millis() - startedAt < 1500) {
+    size_t got = adcReadSamples(samples, 64, 50);
+    for (size_t index = 0; index < got; index++, seen++) {
+      if (seen < 400) continue;  // the first 50 ms of a capture is unreliable
+      if (samples[index] < minimum) minimum = samples[index];
+      if (samples[index] > maximum) maximum = samples[index];
+      sum += samples[index];
+      counted++;
+    }
+  }
+  adcClose();
+  if (counted == 0) {
+    Serial.println("Microphone check: no samples arrived from the ADC");
+    return;
+  }
+  int average = (int)(sum / counted);
+  Serial.printf("Microphone check on GPIO %d: average %d of 4095, quiet noise swing %d counts\n", MIC_PIN, average, (int)(maximum - minimum));
+  if (average < 300) Serial.println("  -> reads near 0 V: the mic is not connected, or the signal has no bias (see the two bias resistors in the wiring notes)");
+  else if (average > 3800) Serial.println("  -> reads near 3.3 V: check the wiring and the bias resistors");
+  else if (maximum - minimum > 400) Serial.println("  -> very noisy: check the ground connection and keep the mic wires short");
+  else Serial.println("  -> the bias level looks right");
+}
+
+static void micInit() {
+  adc_unit_t unit;
+  adc_channel_t channel;
+  if (adc_continuous_io_to_channel(MIC_PIN, &unit, &channel) != ESP_OK || unit != ADC_UNIT_1) {
+    Serial.printf("Microphone disabled: GPIO %d cannot be read by the ADC. Use GPIO 1-10 and change MIC_PIN.\n", MIC_PIN);
+    return;
+  }
+  micUnit = unit;
+  micChannel = channel;
+  micAvailable = true;
+  micSelfTest();
+}
+
+static void *allocateAudio(size_t bytes) {
+  void *memory = nullptr;
+  if (psramFound()) memory = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (memory == nullptr) memory = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  return memory;
+}
+
+static void releaseRecording() {
+  if (recBuffer != nullptr) {
+    heap_caps_free(recBuffer);
+    recBuffer = nullptr;
+  }
+}
+
+static void releaseVoice() {
+  if (voiceAdpcm != nullptr) {
+    heap_caps_free(voiceAdpcm);
+    voiceAdpcm = nullptr;
+  }
+}
+
+static void recordTask(void *) {
+  int16_t levelMin = 4095;
+  int16_t levelMax = 0;
+  size_t levelSamples = 0;
+  while (!recStopRequested && recCount < recCapacity) {
+    size_t before = recCount;
+    size_t got = adcReadSamples(recBuffer + before, recCapacity - before, 100);
+    for (size_t index = 0; index < got; index++) {
+      int16_t value = recBuffer[before + index];
+      if (value < levelMin) levelMin = value;
+      if (value > levelMax) levelMax = value;
+    }
+    recCount = before + got;
+    levelSamples += got;
+    if (levelSamples >= MIC_SAMPLE_RATE / 10) {
+      recLevel = levelMax - levelMin;
+      levelMin = 4095;
+      levelMax = 0;
+      levelSamples = 0;
+    }
+  }
+  adcClose();
+  recRunning = false;
+  vTaskDelete(nullptr);
+}
+
+static bool startRecording() {
+  if (!micAvailable || recRunning) return false;
+  // Take the longest recording that fits in memory: 6 s is 96 KB.
+  static const uint8_t SECONDS_TO_TRY[] = {6, 4, 3, 2};
+  for (uint8_t seconds : SECONDS_TO_TRY) {
+    recCapacity = (size_t)seconds * MIC_SAMPLE_RATE;
+    recBuffer = (int16_t *)allocateAudio(recCapacity * sizeof(int16_t));
+    if (recBuffer != nullptr) break;
+  }
+  if (recBuffer == nullptr) return false;
+  recCount = 0;
+  recLevel = 0;
+  recStopRequested = false;
+  if (!adcOpen()) {
+    releaseRecording();
+    return false;
+  }
+  recRunning = true;
+  xTaskCreatePinnedToCore(recordTask, "mic", 4096, nullptr, 2, nullptr, 1);
+  Serial.printf("Recording started, up to %u s (free heap %u bytes)\n", (unsigned)(recCapacity / MIC_SAMPLE_RATE), (unsigned)ESP.getFreeHeap());
+  return true;
+}
+
+static void stopRecording() {
+  recStopRequested = true;
+  for (uint32_t waited = 0; recRunning && waited < 500; waited += 5) delay(5);
+}
+
+static uint32_t peakHistogram[2048];
+
+// Cleans the recording the same way as the tested Uno script (remove the DC level, then scale to a healthy
+// volume), then compresses it. Returns false with a message for the screen when there was no usable sound.
+static bool prepareVoice(char *error, size_t errorSize) {
+  const size_t settle = MIC_SAMPLE_RATE / 20;
+  if (recCount < settle + MIC_SAMPLE_RATE * 4 / 10) {
+    strlcpy(error, "That was too short. Tap + and speak.", errorSize);
+    return false;
+  }
+  int16_t *pcm = recBuffer + settle;
+  size_t count = recCount - settle;
+
+  const float alpha = 0.995f;  // DC blocker, about 6 Hz at 8 kHz
+  memset(peakHistogram, 0, sizeof(peakHistogram));
+  double sum = 0;
+  float previousIn = pcm[0];
+  float previousOut = 0;
+  for (size_t index = 0; index < count; index++) {
+    float x = pcm[index];
+    sum += x;
+    float y = x - previousIn + alpha * previousOut;
+    previousIn = x;
+    previousOut = y;
+    int magnitude = (int)fabsf(y);
+    peakHistogram[magnitude > 2047 ? 2047 : magnitude]++;
+  }
+  // The peak ignores the loudest 0.1% so a single click does not set the volume.
+  size_t allowed = count / 1000;
+  size_t seen = 0;
+  int peak = 0;
+  for (int bin = 2047; bin >= 0; bin--) {
+    seen += peakHistogram[bin];
+    if (seen > allowed) {
+      peak = bin;
+      break;
+    }
+  }
+  Serial.printf("Voice: %u samples, DC level %.0f of 4095, speech peak %d counts (needs %d)\n", (unsigned)count, sum / count, peak, MIC_MIN_PEAK);
+  if (peak < MIC_MIN_PEAK) {
+    strlcpy(error, "I can't hear you. Speak closer, or check the microphone.", errorSize);
+    return false;
+  }
+
+  float gain = 0.9f * 32767.0f / peak;
+  previousIn = pcm[0];
+  previousOut = 0;
+  for (size_t index = 0; index < count; index++) {
+    float x = pcm[index];
+    float y = x - previousIn + alpha * previousOut;
+    previousIn = x;
+    previousOut = y;
+    float scaled = y * gain;
+    if (scaled > 32767.0f) scaled = 32767.0f;
+    if (scaled < -32767.0f) scaled = -32767.0f;
+    pcm[index] = (int16_t)lrintf(scaled);
+  }
+
+  voiceAdpcm = (uint8_t *)allocateAudio((count + 1) / 2);
+  if (voiceAdpcm == nullptr) {
+    strlcpy(error, "Not enough memory to send that.", errorSize);
+    return false;
+  }
+  AdpcmState state = {pcm[0], 0};
+  voiceStart = state;
+  voiceAdpcmBytes = adpcmEncode(pcm, count, voiceAdpcm, state);
+  voiceSamples = count;
+  releaseRecording();
+  Serial.printf("Voice: gain %.0fx, %u bytes after compression\n", gain, (unsigned)voiceAdpcmBytes);
+  return true;
+}
+
+// ---- Voice-add flow -------------------------------------------------------------------------------------------------
+
+static void abortVoice() {
+  if (recRunning) stopRecording();
+  releaseRecording();
+  releaseVoice();
+  voicePhase = VOICE_IDLE;
+}
+
+static void failVoice(const char *message) {
+  abortVoice();
+  copyText(modalError, sizeof(modalError), message);
+  showModal(MODAL_ERROR);
+}
+
+static void beginVoiceAdd() {
+  if (!micAvailable) {
+    char message[96];
+    snprintf(message, sizeof(message), "The microphone is not working. See the Serial Monitor (pin %d).", MIC_PIN);
+    failVoice(message);
+    return;
+  }
+  if (!shownConnected) {
+    failVoice("Not connected to the bridge.");
+    return;
+  }
+  if (!startRecording()) {
+    failVoice("Could not start recording. Not enough memory.");
+    return;
+  }
+  voicePhase = VOICE_RECORDING;
+  voiceUiAt = 0;
+  showModal(MODAL_RECORDING);
+}
+
+static void finishRecording() {
+  stopRecording();
+  char error[96];
+  if (!prepareVoice(error, sizeof(error))) {
+    failVoice(error);
+    return;
+  }
+  voiceSid++;
+  if (voiceSid == 0) voiceSid = 1;
+  voiceStage = 0;
+  voiceOffset = 0;
+  voiceSeq = 0;
+  voiceLastPercent = 255;
+  voiceProgressAt = millis();
+  voicePhase = VOICE_SENDING;
+  showModal(MODAL_VOICE_SENDING);
+}
+
+static void putUint16(uint8_t *target, uint16_t value) {
+  target[0] = value & 0xFF;
+  target[1] = value >> 8;
+}
+
+static void putUint32(uint8_t *target, uint32_t value) {
+  for (uint8_t index = 0; index < 4; index++) target[index] = (value >> (8 * index)) & 0xFF;
+}
+
+static size_t audioPayloadSize() {
+  uint16_t mtu = 23;
+  NimBLEServer *server = NimBLEDevice::getServer();
+  if (server != nullptr) mtu = server->getPeerMTU(bleConnHandle);
+  size_t chunk = mtu > 23 ? mtu - 3 : 20;
+  if (chunk > 180) chunk = 180;
+  return chunk - 4;
+}
+
+// Sends a few packets per pass so the screen stays responsive. A notification that does not fit in the
+// Bluetooth queue is simply retried on the next pass.
+static void voiceSendTick() {
+  if (voicePhase != VOICE_SENDING) return;
+  uint32_t now = millis();
+  size_t payloadSize = audioPayloadSize();
+  uint8_t packet[200];
+  for (uint8_t burst = 0; burst < 8 && voicePhase == VOICE_SENDING; burst++) {
+    size_t length = 0;
+    if (voiceStage == 0) {
+      packet[0] = 1;
+      packet[1] = voiceSid;
+      putUint16(packet + 2, MIC_SAMPLE_RATE);
+      putUint32(packet + 4, voiceSamples);
+      putUint16(packet + 8, (uint16_t)voiceStart.predictor);
+      packet[10] = voiceStart.index;
+      length = 11;
+    } else if (voiceStage == 1) {
+      size_t remaining = voiceAdpcmBytes - voiceOffset;
+      if (remaining == 0) {
+        voiceStage = 2;
+        continue;
+      }
+      size_t size = remaining < payloadSize ? remaining : payloadSize;
+      packet[0] = 2;
+      packet[1] = voiceSid;
+      putUint16(packet + 2, voiceSeq);
+      memcpy(packet + 4, voiceAdpcm + voiceOffset, size);
+      length = 4 + size;
+    } else {
+      packet[0] = 3;
+      packet[1] = voiceSid;
+      putUint16(packet + 2, voiceSeq);
+      putUint32(packet + 4, voiceAdpcmBytes);
+      length = 8;
+    }
+
+    audioTxCharacteristic->setValue(packet, length);
+    if (!audioTxCharacteristic->notify()) break;
+    voiceProgressAt = now;
+    if (voiceStage == 0) {
+      voiceStage = 1;
+    } else if (voiceStage == 1) {
+      voiceOffset += length - 4;
+      voiceSeq++;
+    } else {
+      voiceStage = 3;
+      voicePhase = VOICE_WAITING;
+      voiceWaitSince = now;
+      releaseVoice();
+      showModal(MODAL_VOICE_SENDING);
+    }
+  }
+
+  if (voicePhase == VOICE_SENDING) {
+    uint8_t percent = voiceAdpcmBytes ? (uint8_t)(voiceOffset * 100 / voiceAdpcmBytes) : 0;
+    if (percent != voiceLastPercent && modalBodyLabel != nullptr) {
+      voiceLastPercent = percent;
+      lv_label_set_text_fmt(modalBodyLabel, "Sending your voice... %u%%", percent);
+    }
+    if (now - voiceProgressAt > 5000) failVoice("Could not send the audio to the bridge.");
+  }
 }
 
 // ---- Rendering -----------------------------------------------------------------------------------------
@@ -768,6 +1287,8 @@ static void renderUi() {
   else savedScrollY = 0;
   lv_obj_clean(screenRoot);
   modalRoot = nullptr;
+  modalBodyLabel = nullptr;
+  modalLevelBar = nullptr;
   listObj = nullptr;
   timerLabel = nullptr;
 
@@ -783,6 +1304,11 @@ static void renderUi() {
     lv_obj_update_layout(listObj);
     lv_obj_scroll_to_y(listObj, savedScrollY, LV_ANIM_OFF);
   }
+  if (scrollToLast && listObj != nullptr && lv_obj_get_child_cnt(listObj) > 0) {
+    lv_obj_update_layout(listObj);
+    lv_obj_scroll_to_view(lv_obj_get_child(listObj, lv_obj_get_child_cnt(listObj) - 1), LV_ANIM_OFF);
+  }
+  scrollToLast = false;
   if (modal != MODAL_NONE) drawModal();
   uiDirty = false;
   keepScroll = false;
@@ -931,6 +1457,7 @@ static void sendDone() {
   statusCharacteristic->setValue("DONE");
   statusCharacteristic->notify();
   Serial.println("Sent DONE to the Pi");
+  VIBRATE(PATTERN_STEP_DONE);
   stepMode = STEP_SENT;
   sentAt = millis();
   uiDirty = true;
@@ -970,6 +1497,7 @@ static void onRpcError(RpcKind kind, const char *error) {
       uiDirty = true;
       break;
     case RPC_REMOVE:
+    case RPC_ADD:
     case RPC_UNLINK:
       copyText(modalError, sizeof(modalError), error);
       showModal(MODAL_ERROR);
@@ -987,8 +1515,8 @@ static void onRpcError(RpcKind kind, const char *error) {
 }
 
 static void handleReply(JsonDocument &doc, RpcKind kind) {
-  if (connectError[0] != ' ' && (kind == RPC_STATUS || kind == RPC_PAIR || kind == RPC_LINK_STATUS)) {
-    connectError[0] = ' ';
+  if (connectError[0] != '\0' && (kind == RPC_STATUS || kind == RPC_PAIR || kind == RPC_LINK_STATUS)) {
+    connectError[0] = '\0';
     uiDirty = true;
   }
   switch (kind) {
@@ -1044,6 +1572,12 @@ static void handleReply(JsonDocument &doc, RpcKind kind) {
       showModal(MODAL_NONE);
       uiDirty = true;
       break;
+    case RPC_ADD:
+      applyTasks(doc);
+      scrollToLast = true;
+      showModal(MODAL_NONE);
+      uiDirty = true;
+      break;
     case RPC_UNLINK:
       stepMode = STEP_NONE;
       setUnlinked();
@@ -1064,6 +1598,20 @@ static void handleMessage(const std::string &line) {
     // The bridge just subscribed to us, so this is the moment to ask who is linked.
     helloSeen = true;
     needStatus = true;
+    return;
+  }
+  if (strcmp(type, "transcript") == 0) {
+    // The bridge finished turning the recording into text (or could not).
+    if (voicePhase != VOICE_WAITING || (uint32_t)(doc["sid"] | 0) != voiceSid) return;
+    voicePhase = VOICE_IDLE;
+    const char *text = doc["text"] | "";
+    if ((doc["ok"] | false) && text[0]) {
+      copyText(voiceText, sizeof(voiceText), text);
+      Serial.printf("Heard: %s\n", voiceText);
+      showModal(MODAL_VOICE_CONFIRM);
+    } else {
+      failVoice(doc["error"] | "I could not understand that.");
+    }
     return;
   }
   uint32_t id = doc["id"] | 0;
@@ -1105,6 +1653,7 @@ static void syncUi() {
       // Nothing can answer any more, so stop waiting on it.
       pendingKind = RPC_NONE;
       pendingId = 0;
+      if (voicePhase != VOICE_IDLE) failVoice("Lost the connection to the bridge.");
       if (worksState == LOAD_LOADING) worksState = LOAD_ERROR;
       if (tasksState == LOAD_LOADING) tasksState = LOAD_ERROR;
       if (modal == MODAL_BUSY) {
@@ -1115,8 +1664,10 @@ static void syncUi() {
   }
 
   if (changed) {
+    if (voicePhase != VOICE_IDLE) abortVoice();  // a new step takes over the screen
     copyText(currentStep, sizeof(currentStep), taskCopy);
     stepStartedAt = millis();
+    VIBRATE(PATTERN_NEW_STEP);
     stepMode = STEP_ACTIVE;
     Serial.print("Display updated: ");
     Serial.println(currentStep);
@@ -1156,6 +1707,24 @@ static void runLogic() {
       requestMatrix();
     }
   }
+
+  if (voicePhase == VOICE_RECORDING) {
+    if (modal == MODAL_RECORDING && now - voiceUiAt > 100) {
+      voiceUiAt = now;
+      if (modalLevelBar != nullptr) lv_bar_set_value(modalLevelBar, recLevel / 2 > 100 ? 100 : recLevel / 2, LV_ANIM_OFF);
+      if (modalBodyLabel != nullptr) {
+        static uint32_t shownSeconds = 0xFFFFFFFF;
+        uint32_t seconds = recCount / MIC_SAMPLE_RATE;
+        if (seconds != shownSeconds) {
+          shownSeconds = seconds;
+          lv_label_set_text_fmt(modalBodyLabel, "0:%02u / 0:%02u", (unsigned)seconds, (unsigned)(recCapacity / MIC_SAMPLE_RATE));
+        }
+      }
+    }
+    if (!recRunning) finishRecording();  // it ran to the maximum length
+  }
+  voiceSendTick();
+  if (voicePhase == VOICE_WAITING && now - voiceWaitSince > 40000) failVoice("The Pi took too long to answer.");
 
   // After DONE the next step normally arrives within a second; if none does, go back to the matrix.
   if (screen == SCR_STEP && stepMode == STEP_SENT && now - sentAt > SENT_SCREEN_MS) {
@@ -1231,6 +1800,24 @@ static void runAction() {
         showModal(MODAL_BUSY);
       }
       break;
+    case ACT_VOICE_ADD:
+      if (screen == SCR_SUBTASKS && tasksState == LOAD_READY) beginVoiceAdd();
+      break;
+    case ACT_VOICE_STOP:
+      if (voicePhase == VOICE_RECORDING) finishRecording();
+      break;
+    case ACT_VOICE_CANCEL:
+      abortVoice();
+      showModal(MODAL_NONE);
+      break;
+    case ACT_VOICE_CONFIRM:
+      if (!startRpc(RPC_ADD, "add", "work", selectedWorkId, "text", voiceText)) {
+        copyText(modalError, sizeof(modalError), "Not connected to the bridge.");
+        showModal(MODAL_ERROR);
+      } else {
+        showModal(MODAL_BUSY);
+      }
+      break;
     default:
       break;
   }
@@ -1298,8 +1885,12 @@ void setup() {
   Serial.println("Starting BandFlow wristband BLE...");
 
   rxMutex = xSemaphoreCreateMutex();
+  pinMode(VIBRATION_PIN, OUTPUT);
+  motorWrite(false);
   setupDisplay();
   renderUi();
+  micInit();
+  VIBRATE(PATTERN_BOOT);  // a short buzz at power-on shows the motor is wired up
 
   NimBLEDevice::init("BandFlow-Wristband");
   NimBLEDevice::setMTU(247);
@@ -1326,6 +1917,7 @@ void setup() {
   NimBLECharacteristic *rpcRx = service->createCharacteristic(RPC_RX_CHAR_UUID, NIMBLE_PROPERTY::WRITE);
   rpcRx->setCallbacks(new RpcRxCallback());
   rpcTxCharacteristic = service->createCharacteristic(RPC_TX_CHAR_UUID, NIMBLE_PROPERTY::NOTIFY);
+  audioTxCharacteristic = service->createCharacteristic(AUDIO_TX_CHAR_UUID, NIMBLE_PROPERTY::NOTIFY);
 
   service->start();
 
@@ -1346,6 +1938,7 @@ void loop() {
   syncUi();
   drainReplies();
   runLogic();
+  runHaptics();
   runAction();
   if (uiDirty) renderUi();
   lv_timer_handler();

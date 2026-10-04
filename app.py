@@ -7,6 +7,7 @@ tasks, subtasks, progress, and the primary SQLite database.
 import asyncio
 import json
 import os
+import struct
 import threading
 import urllib.error
 import urllib.request
@@ -18,6 +19,8 @@ from pathlib import Path
 from bleak import BleakClient, BleakScanner
 from flask import Flask, jsonify, request
 
+import voice
+
 SERVICE_UUID = "12345678-1234-1234-1234-1234567890ab"
 TASK_CHAR_UUID = "12345678-1234-1234-1234-1234567890ac"
 STATUS_CHAR_UUID = "12345678-1234-1234-1234-1234567890ad"
@@ -25,6 +28,16 @@ STATUS_CHAR_UUID = "12345678-1234-1234-1234-1234567890ad"
 # Both carry newline-terminated JSON split into BLE-sized chunks.
 RPC_RX_CHAR_UUID = "12345678-1234-1234-1234-1234567890ae"
 RPC_TX_CHAR_UUID = "12345678-1234-1234-1234-1234567890af"
+# Voice recordings: the watch notifies audio packets here. Packet layouts (little endian):
+#   START 0x01 | session u8 | sample rate u16 | total samples u32 | ADPCM predictor i16 | ADPCM index u8
+#   DATA  0x02 | session u8 | sequence u16 | ADPCM bytes
+#   END   0x03 | session u8 | packet count u16 | total ADPCM bytes u32
+# When the END packet arrives the bridge transcribes the audio and writes {"t":"transcript"} to RPC_RX.
+AUDIO_TX_CHAR_UUID = "12345678-1234-1234-1234-1234567890b0"
+AUDIO_START, AUDIO_DATA, AUDIO_END = 1, 2, 3
+# Set BANDFLOW_SAVE_AUDIO=1 to keep the last recording as last-voice.wav, handy when tuning the microphone.
+SAVE_AUDIO = os.environ.get("BANDFLOW_SAVE_AUDIO", "") == "1"
+VOICE_DEBUG_PATH = Path(__file__).resolve().parent / "last-voice.wav"
 TARGET_NAME = "BandFlow-Wristband"
 BRIDGE_API_VERSION = "v2"
 SUPPORTED_BRIDGE_VERSIONS = {"v1", "v2"}
@@ -126,6 +139,7 @@ class BandFlowBle:
         self._write_lock = None
         self._rx_buffer = bytearray()
         self._pending = set()
+        self._voice = None
         self.thread = threading.Thread(target=self._run, name="bandflow-ble", daemon=True)
 
     def start(self):
@@ -170,6 +184,7 @@ class BandFlowBle:
                     self.address = str(device.address).lower()
                     self._write_lock = asyncio.Lock()
                     self._rx_buffer = bytearray()
+                    self._voice = None
                     self._connected = asyncio.Event()
                     self._connected.set()
 
@@ -184,6 +199,10 @@ class BandFlowBle:
 
                     await client.start_notify(STATUS_CHAR_UUID, on_status)
                     await client.start_notify(RPC_TX_CHAR_UUID, self._on_rpc_chunk)
+                    try:
+                        await client.start_notify(AUDIO_TX_CHAR_UUID, self._on_audio_packet)
+                    except Exception as error:
+                        print(f"Voice input is unavailable (flash the newest firmware): {error}")
                     print("Connected!")
                     # The watch waits for this before it asks who is linked.
                     await self._send_rpc({"t": "hello"})
@@ -191,6 +210,10 @@ class BandFlowBle:
                     await disconnected.wait()
                     await client.stop_notify(STATUS_CHAR_UUID)
                     await client.stop_notify(RPC_TX_CHAR_UUID)
+                    try:
+                        await client.stop_notify(AUDIO_TX_CHAR_UUID)
+                    except Exception:
+                        pass
             except Exception as error:
                 print(f"BLE connection error: {error}; retrying...")
             finally:
@@ -229,6 +252,57 @@ class BandFlowBle:
                 task = self.loop.create_task(self._handle_band_message(line))
                 self._pending.add(task)
                 task.add_done_callback(self._pending.discard)
+
+    def _on_audio_packet(self, _, data):
+        data = bytes(data)
+        if len(data) < 2:
+            return
+        kind, session = data[0], data[1]
+        if kind == AUDIO_START and len(data) >= 11:
+            rate, total, predictor, index = struct.unpack("<HIhB", data[2:11])
+            self._voice = {"session": session, "rate": rate, "total": total, "predictor": predictor, "index": index,
+                           "chunks": [], "next_seq": 0, "bytes": 0, "intact": True}
+            print(f"Voice recording {session} started: {total} samples at {rate} Hz")
+        elif self._voice is None or self._voice["session"] != session:
+            return  # a late packet from a recording that was replaced or cancelled
+        elif kind == AUDIO_DATA and len(data) >= 4:
+            (sequence,) = struct.unpack("<H", data[2:4])
+            if sequence != self._voice["next_seq"]:
+                self._voice["intact"] = False
+            self._voice["next_seq"] = sequence + 1
+            self._voice["chunks"].append(data[4:])
+            self._voice["bytes"] += len(data) - 4
+        elif kind == AUDIO_END and len(data) >= 8:
+            packets, total_bytes = struct.unpack("<HI", data[2:8])
+            recording, self._voice = self._voice, None
+            if packets != recording["next_seq"] or total_bytes != recording["bytes"]:
+                recording["intact"] = False
+            task = self.loop.create_task(self._finish_voice(recording))
+            self._pending.add(task)
+            task.add_done_callback(self._pending.discard)
+
+    async def _finish_voice(self, recording):
+        reply = {"t": "transcript", "sid": recording["session"]}
+        try:
+            if not recording["intact"]:
+                raise voice.VoiceError("Part of the audio was lost on the way. Please try again.")
+            text, pcm = await asyncio.to_thread(
+                voice.transcribe_recording, b"".join(recording["chunks"]), recording["rate"], recording["total"],
+                recording["predictor"], recording["index"])
+            if SAVE_AUDIO:
+                VOICE_DEBUG_PATH.write_bytes(voice.pcm_to_wav(pcm, recording["rate"]))
+            print(f"Heard: {text!r}")
+            reply.update(ok=True, text=text)
+        except voice.VoiceError as error:
+            print(f"Voice request failed: {error}")
+            reply.update(ok=False, error=str(error))
+        except Exception as error:  # never leave the watch waiting
+            print(f"Voice request crashed: {error!r}")
+            reply.update(ok=False, error="Something went wrong while understanding that.")
+        try:
+            await self._send_rpc(reply)
+        except Exception as error:
+            print(f"Could not send the transcript to the band: {error}")
 
     async def _handle_band_message(self, line):
         try:

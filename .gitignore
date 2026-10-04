@@ -10,3 +10,4 @@ ble-assignment.json
 *.sqlite-wal
 *.sqlite-shm
 .vscode/
+last-voice.wav
