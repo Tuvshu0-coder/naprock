@@ -39,8 +39,8 @@ AUDIO_START, AUDIO_DATA, AUDIO_END = 1, 2, 3
 SAVE_AUDIO = os.environ.get("BANDFLOW_SAVE_AUDIO", "") == "1"
 VOICE_DEBUG_PATH = Path(__file__).resolve().parent / "last-voice.wav"
 TARGET_NAME = "BandFlow-Wristband"
-BRIDGE_API_VERSION = "v2"
-SUPPORTED_BRIDGE_VERSIONS = {"v1", "v2"}
+BRIDGE_API_VERSION = "v3"
+SUPPORTED_BRIDGE_VERSIONS = {"v1", "v2", "v3"}
 
 SCAN_SECONDS = 15.0
 RECONNECT_DELAY_SECONDS = 5.0
@@ -285,7 +285,7 @@ class BandFlowBle:
         reply = {"t": "transcript", "sid": recording["session"]}
         try:
             if not recording["intact"]:
-                raise voice.VoiceError("Part of the audio was lost on the way. Please try again.")
+                raise voice.VoiceError("Part of the audio was lost on the way. Please try again.", "audio_lost")
             text, pcm = await asyncio.to_thread(
                 voice.transcribe_recording, b"".join(recording["chunks"]), recording["rate"], recording["total"],
                 recording["predictor"], recording["index"])
@@ -295,10 +295,10 @@ class BandFlowBle:
             reply.update(ok=True, text=text)
         except voice.VoiceError as error:
             print(f"Voice request failed: {error}")
-            reply.update(ok=False, error=str(error))
+            reply.update(ok=False, error=str(error), code=error.code)
         except Exception as error:  # never leave the watch waiting
             print(f"Voice request crashed: {error!r}")
-            reply.update(ok=False, error="Something went wrong while understanding that.")
+            reply.update(ok=False, error="Something went wrong while understanding that.", code="stt_error")
         try:
             await self._send_rpc(reply)
         except Exception as error:

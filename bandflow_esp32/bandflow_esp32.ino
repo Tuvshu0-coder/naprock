@@ -165,7 +165,7 @@ struct WorkRow {
 struct TaskRow {
   char id[40];
   char text[84];
-  char state;  // 'd' done, 'a' on the watch, 'p' pending
+  char state;  // 'd' done, 'a' on the watch, 'p' pending, 'l' locked until the step before it is done
 };
 
 static const uint8_t MAX_WORKS = 12;
@@ -625,6 +625,7 @@ static void drawTaskRow(lv_obj_t *list, uint8_t index) {
   const TaskRow &task = tasks[index];
   bool done = task.state == 'd';
   bool active = task.state == 'a';
+  bool locked = task.state == 'l';
   lv_obj_t *row = makeButton(list, LV_PCT(100), 36, COLOR_SURFACE, COLOR_SURFACE_PRESS, 10, ACT_OPEN_TASK, index);
   lv_obj_set_style_border_color(row, color(active ? COLOR_ACCENT : COLOR_BORDER), 0);
   lv_obj_set_style_border_width(row, 1, 0);
@@ -641,16 +642,17 @@ static void drawTaskRow(lv_obj_t *list, uint8_t index) {
     lv_obj_center(makeLabel(box, LV_SYMBOL_OK, COLOR_ACCENT_TEXT));
   }
 
-  lv_obj_t *text = makeClippedLabel(row, task.text, active ? COLOR_TITLE : COLOR_BODY, active ? 190 : 248);
+  lv_obj_t *text = makeClippedLabel(row, task.text, active ? COLOR_TITLE : COLOR_BODY, active || locked ? 190 : 248);
   lv_obj_align(text, LV_ALIGN_LEFT_MID, 36, 0);
   if (done) lv_obj_set_style_text_decor(text, LV_TEXT_DECOR_STRIKETHROUGH, 0);
-  if (active) {
+  if (active || locked) {
+    uint32_t chipColor = active ? COLOR_ACCENT : COLOR_BODY;
     lv_obj_t *chip = makeBox(row, 56, 20);
     lv_obj_align(chip, LV_ALIGN_RIGHT_MID, -8, 0);
     lv_obj_set_style_radius(chip, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_color(chip, color(COLOR_ACCENT), 0);
+    lv_obj_set_style_border_color(chip, color(active ? COLOR_ACCENT : COLOR_BORDER), 0);
     lv_obj_set_style_border_width(chip, 1, 0);
-    lv_obj_center(makeLabel(chip, "WATCH", COLOR_ACCENT));
+    lv_obj_center(makeLabel(chip, active ? "WATCH" : "LOCK", chipColor));
   }
 }
 
@@ -735,7 +737,7 @@ static void drawModal() {
 
   switch (modal) {
     case MODAL_TASK:
-      caption = task.state == 'a' ? "TASK - ON THE WATCH" : task.state == 'd' ? "TASK - DONE" : "TASK";
+      caption = task.state == 'a' ? "TASK - ON THE WATCH" : task.state == 'd' ? "TASK - DONE" : task.state == 'l' ? "TASK - LOCKED" : "TASK";
       body = task.text;
       leftText = "Close";
       rightText = "Remove";

@@ -8,6 +8,7 @@ import io
 import json
 import os
 import struct
+import unicodedata
 import urllib.error
 import urllib.request
 import uuid
@@ -24,6 +25,13 @@ WHISPER_TIMEOUT_SECONDS = 30
 
 MIN_SECONDS = 0.4
 MAX_SECONDS = 15
+# The watch keeps the text in a 124-byte buffer while the worker confirms it.
+MAX_TEXT_LENGTH = 120
+
+# What Whisper tends to write when it is given noise or silence instead of speech.
+_NOISE_PHRASES = {"you", "the", "so", "bye", "bye bye", "thanks", "thank you", "thank you very much",
+                  "thanks for watching", "thank you for watching", "please subscribe"}
+_PLAIN = {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-", "\u2014": "-", "\u2026": "..."}
 
 _INDEX_STEP = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8]
 _STEP_SIZE = [
@@ -36,7 +44,12 @@ _STEP_SIZE = [
 
 
 class VoiceError(Exception):
-    """An error that is safe to show on the watch."""
+    """An error that is safe to show on the watch. `code` says which kind, for anything that wants to react to it:
+    too_short, too_long, bad_format, audio_lost, silence, unclear, stt_not_configured, stt_unreachable, stt_error."""
+
+    def __init__(self, message, code="stt_error"):
+        super().__init__(message)
+        self.code = code
 
 
 def adpcm_decode(data, total_samples, predictor, index):
@@ -87,7 +100,7 @@ def whisper_transcribe(wav_bytes):
     """Send a WAV file to the Whisper API and return the text."""
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key and "api.openai.com" in WHISPER_URL:
-        raise VoiceError("Speech-to-text is not set up on the Pi. Set OPENAI_API_KEY and restart the bridge.")
+        raise VoiceError("Speech-to-text is not set up on the Pi. Set OPENAI_API_KEY and restart the bridge.", "stt_not_configured")
     fields = {"model": WHISPER_MODEL, "response_format": "json", "temperature": "0"}
     if WHISPER_LANGUAGE:
         fields["language"] = WHISPER_LANGUAGE
@@ -106,32 +119,55 @@ def whisper_transcribe(wav_bytes):
             detail = json.loads(error.read().decode("utf-8")).get("error", {}).get("message", "")
         except (ValueError, UnicodeDecodeError):
             detail = ""
-        raise VoiceError(f"Speech service said: {detail or f'error {error.code}'}") from error
+        raise VoiceError(to_watch_text(f"Speech service said: {detail or f'error {error.code}'}")[:MAX_TEXT_LENGTH], "stt_error") from error
     except (urllib.error.URLError, TimeoutError, OSError) as error:
-        raise VoiceError("Could not reach the speech service. Check the Pi's internet connection.") from error
+        raise VoiceError("Could not reach the speech service. Check the Pi's internet connection.", "stt_unreachable") from error
+    except ValueError as error:
+        raise VoiceError("The speech service sent an answer I could not read.", "stt_error") from error
+
+
+def to_watch_text(text):
+    """Swap curly quotes, dashes and accented letters for plain ones: the watch font only has ASCII."""
+    plain = "".join(_PLAIN.get(character, character) for character in str(text))
+    return "".join(character for character in unicodedata.normalize("NFKD", plain) if not unicodedata.combining(character))
 
 
 def clean_transcript(text):
     """Whisper adds a trailing full stop and sometimes quotes; a task title does not need them."""
-    cleaned = " ".join(str(text).split()).strip(" \"'")
+    cleaned = " ".join(to_watch_text(text).split()).strip(" \"'")
     while cleaned and cleaned[-1] in ".!?,;:":
         cleaned = cleaned[:-1].rstrip()
-    return cleaned
+    return cleaned.rstrip(" \"'")
+
+
+def check_transcript(text):
+    """Refuse text that is not a usable task. Raises VoiceError with a message for the watch."""
+    words = "".join(character if character.isalnum() else " " for character in text.lower()).split()
+    if not words:
+        raise VoiceError("I did not hear any words. Try again, closer to the mic.", "silence")
+    spoken = " ".join(words)
+    prompt = " ".join("".join(character if character.isalnum() else " " for character in WHISPER_PROMPT.lower()).split())
+    # With unclear audio Whisper repeats its own prompt or falls back on a stock phrase.
+    if spoken in _NOISE_PHRASES or (len(words) >= 3 and spoken in prompt) or sum(character.isalpha() for character in text) < 2:
+        raise VoiceError("I could not understand that. Say the task again, slowly and clearly.", "unclear")
+    if not text.isascii():
+        raise VoiceError("I heard words the watch cannot show. Please say the task in English.", "unclear")
+    if len(text) > MAX_TEXT_LENGTH:
+        raise VoiceError("That is too long for one task. Say it in fewer words.", "too_long")
+    return text
 
 
 def transcribe_recording(adpcm, sample_rate, total_samples, predictor, index, transcribe=None):
     """Turn one received recording into task text. Raises VoiceError with a message for the watch."""
     if not 4000 <= sample_rate <= 48000:
-        raise VoiceError("The audio format was not recognized.")
+        raise VoiceError("The audio format was not recognized.", "bad_format")
     seconds = total_samples / sample_rate
     if seconds < MIN_SECONDS:
-        raise VoiceError("That was too short. Hold the mic button and speak.")
+        raise VoiceError("That was too short. Tap + and speak.", "too_short")
     if seconds > MAX_SECONDS:
-        raise VoiceError("That recording was too long.")
+        raise VoiceError("That recording was too long.", "too_long")
     if len(adpcm) < (total_samples + 1) // 2:
-        raise VoiceError("Part of the audio was lost on the way. Please try again.")
+        raise VoiceError("Part of the audio was lost on the way. Please try again.", "audio_lost")
     pcm = adpcm_decode(adpcm, total_samples, predictor, index)
-    text = clean_transcript((transcribe or whisper_transcribe)(pcm_to_wav(pcm, sample_rate)))
-    if not text:
-        raise VoiceError("I could not make out any words. Try again, closer to the mic.")
+    text = check_transcript(clean_transcript((transcribe or whisper_transcribe)(pcm_to_wav(pcm, sample_rate))))
     return text, pcm
