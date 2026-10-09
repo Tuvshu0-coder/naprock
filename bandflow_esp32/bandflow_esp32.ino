@@ -243,6 +243,11 @@ static uint16_t voiceSeq = 0;
 static uint8_t voiceLastPercent = 255;
 static uint32_t voiceProgressAt = 0;
 static uint32_t voiceLastPacketAt = 0;
+static uint8_t voiceRetries = 0;  // times the same recording was sent again because packets were lost
+static size_t voicePayload = 0;   // audio bytes per packet for this recording; a resent packet must use the same size
+static uint16_t voiceResend[40];  // packet numbers the bridge asked for again
+static uint8_t voiceResendCount = 0;
+static uint8_t voiceResendIndex = 0;
 static uint32_t voiceWaitSince = 0;
 static uint32_t voiceUiAt = 0;
 static char voiceText[124] = "";
@@ -290,9 +295,8 @@ static void sendRpcLine(const char *line, size_t length) {
   if (chunk > 180) chunk = 180;
   for (size_t offset = 0; offset < length; offset += chunk) {
     size_t size = length - offset < chunk ? length - offset : chunk;
-    rpcTxCharacteristic->setValue((const uint8_t *)line + offset, size);
-    rpcTxCharacteristic->notify();
-    delay(8);
+    // Same reason as the audio packets: queue this exact chunk, and wait briefly if the queue is full.
+    for (uint8_t attempt = 0; attempt < 40 && !rpcTxCharacteristic->notify((const uint8_t *)line + offset, size); attempt++) delay(5);
   }
 }
 
@@ -1229,13 +1233,8 @@ static void beginVoiceAdd() {
   showModal(MODAL_RECORDING);
 }
 
-static void finishRecording() {
-  stopRecording();
-  char error[96];
-  if (!prepareVoice(error, sizeof(error))) {
-    failVoice(error);
-    return;
-  }
+// Starts (or restarts) sending the compressed recording under a new session number.
+static void startVoiceSend() {
   voiceSid++;
   if (voiceSid == 0) voiceSid = 1;
   voiceStage = 0;
@@ -1245,6 +1244,17 @@ static void finishRecording() {
   voiceProgressAt = millis();
   voicePhase = VOICE_SENDING;
   showModal(MODAL_VOICE_SENDING);
+}
+
+static void finishRecording() {
+  stopRecording();
+  char error[96];
+  if (!prepareVoice(error, sizeof(error))) {
+    failVoice(error);
+    return;
+  }
+  voiceRetries = 0;
+  startVoiceSend();
 }
 
 static void putUint16(uint8_t *target, uint16_t value) {
@@ -1284,6 +1294,7 @@ static void voiceSendTick() {
       putUint32(packet + 4, voiceSamples);
       putUint16(packet + 8, (uint16_t)voiceStart.predictor);
       packet[10] = voiceStart.index;
+      voicePayload = payloadSize;
       length = 11;
     } else if (voiceStage == 1) {
       size_t remaining = voiceAdpcmBytes - voiceOffset;
@@ -1291,11 +1302,30 @@ static void voiceSendTick() {
         voiceStage = 2;
         continue;
       }
-      size_t size = remaining < payloadSize ? remaining : payloadSize;
+      size_t size = remaining < voicePayload ? remaining : voicePayload;
       packet[0] = 2;
       packet[1] = voiceSid;
       putUint16(packet + 2, voiceSeq);
       memcpy(packet + 4, voiceAdpcm + voiceOffset, size);
+      length = 4 + size;
+    } else if (voiceStage == 4) {
+      // Packets the bridge reported missing; each goes out again with its original number.
+      if (voiceResendIndex >= voiceResendCount) {
+        voiceStage = 2;
+        continue;
+      }
+      uint16_t number = voiceResend[voiceResendIndex];
+      size_t offset = (size_t)number * voicePayload;
+      if (offset >= voiceAdpcmBytes) {
+        voiceResendIndex++;
+        continue;
+      }
+      size_t remaining = voiceAdpcmBytes - offset;
+      size_t size = remaining < voicePayload ? remaining : voicePayload;
+      packet[0] = 2;
+      packet[1] = voiceSid;
+      putUint16(packet + 2, number);
+      memcpy(packet + 4, voiceAdpcm + offset, size);
       length = 4 + size;
     } else {
       packet[0] = 3;
@@ -1305,8 +1335,9 @@ static void voiceSendTick() {
       length = 8;
     }
 
-    audioTxCharacteristic->setValue(packet, length);
-    if (!audioTxCharacteristic->notify()) break;
+    // notify(data, length) queues this exact packet. The older setValue() + notify() pair only marks the value as
+    // changed, and a packet stored before the previous one was sent replaced it, so about one in twenty was lost.
+    if (!audioTxCharacteristic->notify(packet, length)) break;
     voiceProgressAt = now;
     voiceLastPacketAt = now;
     if (voiceStage == 0) {
@@ -1314,13 +1345,15 @@ static void voiceSendTick() {
     } else if (voiceStage == 1) {
       voiceOffset += length - 4;
       voiceSeq++;
+    } else if (voiceStage == 4) {
+      voiceResendIndex++;
     } else {
       Serial.printf("Voice: sent %u bytes in %u packets, waiting for the transcript (free heap %u)\n",
                     (unsigned)voiceAdpcmBytes, (unsigned)voiceSeq, (unsigned)ESP.getFreeHeap());
       voiceStage = 3;
       voicePhase = VOICE_WAITING;
       voiceWaitSince = now;
-      releaseVoice();
+      // The recording is kept until the bridge answers, in case it has to be sent again.
       showModal(MODAL_VOICE_SENDING);
     }
   }
@@ -1511,7 +1544,7 @@ static void onLinked(const char *name) {
 // I tell the Raspberry Pi the step is finished; it then sends the next ready subtask.
 static void sendDone() {
   statusCharacteristic->setValue("DONE");
-  statusCharacteristic->notify();
+  for (uint8_t attempt = 0; attempt < 40 && !statusCharacteristic->notify((const uint8_t *)"DONE", 4); attempt++) delay(5);
   Serial.println("Sent DONE to the Pi");
   VIBRATE(PATTERN_STEP_DONE);
   stepMode = STEP_SENT;
@@ -1657,13 +1690,36 @@ static void handleMessage(const std::string &line) {
     needStatus = true;
     return;
   }
+  if (strcmp(type, "audio_resend") == 0) {
+    // The bridge is missing some audio packets: send just those again, then the end marker.
+    if (voicePhase != VOICE_WAITING || (uint32_t)(doc["sid"] | 0) != voiceSid || voiceAdpcm == nullptr) return;
+    voiceResendCount = 0;
+    for (JsonVariant item : doc["missing"].as<JsonArray>()) {
+      if (voiceResendCount < sizeof(voiceResend) / sizeof(voiceResend[0])) voiceResend[voiceResendCount++] = item.as<uint16_t>();
+    }
+    voiceResendIndex = 0;
+    voiceStage = 4;
+    voiceProgressAt = millis();
+    voicePhase = VOICE_SENDING;
+    Serial.printf("The bridge is missing %u packets; sending them again\n", (unsigned)voiceResendCount);
+    showModal(MODAL_VOICE_SENDING);
+    return;
+  }
   if (strcmp(type, "transcript") == 0) {
     // The bridge finished turning the recording into text (or could not).
     if (voicePhase != VOICE_WAITING || (uint32_t)(doc["sid"] | 0) != voiceSid) {
       Serial.printf("Ignoring a transcript: voice phase %d, its session %u, expected %u\n", (int)voicePhase, (unsigned)(doc["sid"] | 0), (unsigned)voiceSid);
       return;
     }
+    const char *code = doc["code"] | "";
+    if (!(doc["ok"] | false) && strcmp(code, "audio_lost") == 0 && voiceRetries < 2 && voiceAdpcm != nullptr) {
+      voiceRetries++;
+      Serial.printf("Part of the audio was lost on the way; sending it again (attempt %u of 3)\n", (unsigned)voiceRetries + 1);
+      startVoiceSend();
+      return;
+    }
     voicePhase = VOICE_IDLE;
+    releaseVoice();
     const char *text = doc["text"] | "";
     if ((doc["ok"] | false) && text[0]) {
       copyText(voiceText, sizeof(voiceText), text);

@@ -11,3 +11,5 @@ ble-assignment.json
 *.sqlite-shm
 .vscode/
 last-voice.wav
+
+bridge.log

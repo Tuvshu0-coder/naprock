@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import struct
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -20,6 +21,38 @@ from bleak import BleakClient, BleakScanner
 from flask import Flask, jsonify, request
 
 import voice
+
+
+class _Tee:
+    """Copies what the bridge prints into bridge.log (next to app.py), with times, so a problem can be looked at afterwards."""
+
+    def __init__(self, terminal, log):
+        self.terminal = terminal
+        self.log = log
+        self.at_line_start = True
+
+    def write(self, text):
+        self.terminal.write(text)
+        try:
+            for part in text.splitlines(keepends=True):
+                if self.at_line_start:
+                    self.log.write(datetime.now().strftime("%H:%M:%S.%f")[:-3] + "  ")
+                self.log.write(part)
+                self.at_line_start = part.endswith("\n")
+            self.log.flush()
+        except OSError:
+            pass
+
+    def flush(self):
+        self.terminal.flush()
+
+
+# Set BANDFLOW_LOG_FILE=0 to switch the log file off (the automated tests do this).
+if os.environ.get("BANDFLOW_LOG_FILE", "1") != "0":
+    try:
+        sys.stdout = _Tee(sys.stdout, open(Path(__file__).resolve().parent / "bridge.log", "a", encoding="utf-8"))
+    except OSError:
+        pass
 
 SERVICE_UUID = "12345678-1234-1234-1234-1234567890ab"
 TASK_CHAR_UUID = "12345678-1234-1234-1234-1234567890ac"
@@ -49,6 +82,10 @@ NODE_EVENT_URL = os.environ.get("NODE_EVENT_URL", "http://127.0.0.1:8787/interna
 NODE_RPC_URL = os.environ.get("NODE_RPC_URL", "http://127.0.0.1:8787/internal/band/rpc")
 MAX_CHUNK_BYTES = 180
 MAX_MESSAGE_BYTES = 8192
+# Bluetooth notifications are not acknowledged, so a few audio packets can go missing. The bridge asks the band to
+# send just those again, up to this many times, and only if no more than this many are missing.
+MAX_RESEND_ROUNDS = 4
+MAX_RESEND_LIST = 40
 INTERNAL_TOKEN = os.environ.get("BLE_INTERNAL_TOKEN", "")
 QUEUE_PATH = Path(os.environ.get("BLE_EVENT_QUEUE_PATH", Path(__file__).resolve().parent / "ble-event-queue.json"))
 STATE_PATH = Path(os.environ.get("BLE_ASSIGNMENT_STATE_PATH", Path(__file__).resolve().parent / "ble-assignment.json"))
@@ -259,6 +296,11 @@ class BandFlowBle:
                 self._pending.add(task)
                 task.add_done_callback(self._pending.discard)
 
+    def _spawn(self, coroutine):
+        task = self.loop.create_task(coroutine)
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
     def _on_audio_packet(self, _, data):
         data = bytes(data)
         if len(data) < 2:
@@ -267,25 +309,44 @@ class BandFlowBle:
         if kind == AUDIO_START and len(data) >= 11:
             rate, total, predictor, index = struct.unpack("<HIhB", data[2:11])
             self._voice = {"session": session, "rate": rate, "total": total, "predictor": predictor, "index": index,
-                           "chunks": [], "next_seq": 0, "bytes": 0, "intact": True}
+                           "chunks": {}, "rounds": 0, "sizes": {}}
             print(f"Voice recording {session} started: {total} samples at {rate} Hz")
+        elif kind == AUDIO_END and len(data) >= 8 and (self._voice is None or self._voice["session"] != session):
+            # The start packet never arrived, so there is nothing to repair: ask the band to send it all again.
+            print(f"Voice recording {session}: got the end without the start; asking for the whole recording again")
+            self._spawn(self._reply_audio_lost(session))
         elif self._voice is None or self._voice["session"] != session:
             return  # a late packet from a recording that was replaced or cancelled
         elif kind == AUDIO_DATA and len(data) >= 4:
             (sequence,) = struct.unpack("<H", data[2:4])
-            if sequence != self._voice["next_seq"]:
-                self._voice["intact"] = False
-            self._voice["next_seq"] = sequence + 1
-            self._voice["chunks"].append(data[4:])
-            self._voice["bytes"] += len(data) - 4
+            self._voice["chunks"].setdefault(sequence, data[4:])  # a packet that arrives twice counts once
+            self._voice["sizes"][len(data)] = self._voice["sizes"].get(len(data), 0) + 1
         elif kind == AUDIO_END and len(data) >= 8:
             packets, total_bytes = struct.unpack("<HI", data[2:8])
-            recording, self._voice = self._voice, None
-            if packets != recording["next_seq"] or total_bytes != recording["bytes"]:
-                recording["intact"] = False
-            task = self.loop.create_task(self._finish_voice(recording))
-            self._pending.add(task)
-            task.add_done_callback(self._pending.discard)
+            self._finish_or_repair(self._voice, packets, total_bytes)
+
+    def _finish_or_repair(self, recording, packets, total_bytes):
+        chunks = recording["chunks"]
+        missing = [number for number in range(packets) if number not in chunks]
+        have_bytes = sum(len(chunk) for chunk in chunks.values())
+        print(f"Voice recording {recording['session']} ended: the band says {packets} packets / {total_bytes} bytes; "
+              f"the bridge has {len(chunks)} packets / {have_bytes} bytes (repair round {recording['rounds']}), "
+              f"packet sizes {recording['sizes']}, missing {missing[:30]}")
+        if not missing and have_bytes == total_bytes:
+            self._voice = None
+            whole = {**recording, "chunks": [chunks[number] for number in range(packets)], "intact": True}
+            self._spawn(self._finish_voice(whole))
+        elif missing and recording["rounds"] < MAX_RESEND_ROUNDS and len(missing) <= MAX_RESEND_LIST:
+            recording["rounds"] += 1
+            print(f"Asking the band to send {len(missing)} packets again")
+            self._spawn(self._send_voice_reply({"t": "audio_resend", "sid": recording["session"], "missing": missing}))
+        else:
+            self._voice = None
+            self._spawn(self._finish_voice({**recording, "chunks": [], "intact": False}))
+
+    async def _reply_audio_lost(self, session):
+        await self._send_voice_reply({"t": "transcript", "sid": session, "ok": False, "code": "audio_lost",
+                                      "error": "Part of the audio was lost on the way. Please try again."})
 
     async def _finish_voice(self, recording):
         reply = {"t": "transcript", "sid": recording["session"]}
@@ -305,15 +366,18 @@ class BandFlowBle:
         except Exception as error:  # never leave the watch waiting
             print(f"Voice request crashed: {error!r}")
             reply.update(ok=False, error="Something went wrong while understanding that.", code="stt_error")
-        # The reply is the last step the worker is waiting on, so it is worth a few tries and a clear log.
+        await self._send_voice_reply(reply)
+
+    async def _send_voice_reply(self, reply):
+        # What the worker is waiting on, so it is worth a few tries and a clear log.
         for attempt in range(1, 4):
             try:
-                print(f"Sending the answer to the band (try {attempt})...")
+                print(f"Sending {reply.get('t')} to the band (try {attempt})...")
                 await asyncio.wait_for(self._send_rpc(reply), timeout=10)
-                print("Answer sent to the band.")
-                break
+                print("Sent to the band.")
+                return
             except Exception as error:
-                print(f"Could not send the answer to the band (try {attempt} of 3): {error!r}")
+                print(f"Could not send it to the band (try {attempt} of 3): {error!r}")
                 await asyncio.sleep(1)
 
     async def _handle_band_message(self, line):
