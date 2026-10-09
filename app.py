@@ -353,11 +353,15 @@ class BandFlowBle:
         try:
             if not recording["intact"]:
                 raise voice.VoiceError("Part of the audio was lost on the way. Please try again.", "audio_lost")
+            def keep_copy(pcm):
+                # Saved before the speech service hears it, so a recording it could not understand can be listened to.
+                if SAVE_AUDIO:
+                    VOICE_DEBUG_PATH.write_bytes(voice.pcm_to_wav(pcm, recording["rate"]))
+                    print(f"Saved what the speech service hears as {VOICE_DEBUG_PATH.name}")
+
             text, pcm = await asyncio.to_thread(
                 voice.transcribe_recording, b"".join(recording["chunks"]), recording["rate"], recording["total"],
-                recording["predictor"], recording["index"])
-            if SAVE_AUDIO:
-                VOICE_DEBUG_PATH.write_bytes(voice.pcm_to_wav(pcm, recording["rate"]))
+                recording["predictor"], recording["index"], on_audio=keep_copy)
             print(f"Heard: {text!r}")
             reply.update(ok=True, text=text)
         except voice.VoiceError as error:

@@ -20,7 +20,12 @@ WHISPER_URL = os.environ.get("WHISPER_URL", "https://api.openai.com/v1").rstrip(
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
 # English by default: the watch screen can only show plain ASCII text. Set WHISPER_LANGUAGE= (empty) to auto-detect.
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "en")
-WHISPER_PROMPT = os.environ.get("WHISPER_PROMPT", "A short work task, for example: Check the pressure gauge on pump three.")
+# No hint by default. A hint such as an example sentence gets repeated back whenever Whisper cannot make out words,
+# which produced tasks the worker never said. Set WHISPER_PROMPT only for a list of unusual words.
+WHISPER_PROMPT = os.environ.get("WHISPER_PROMPT", "")
+# Whisper says how sure it is of each phrase. A phrase it thinks is silence, or one it is guessing at, is dropped.
+MAX_NO_SPEECH = float(os.environ.get("WHISPER_MAX_NO_SPEECH", "0.6"))
+MIN_AVG_LOGPROB = float(os.environ.get("WHISPER_MIN_LOGPROB", "-1.0"))
 WHISPER_TIMEOUT_SECONDS = 30
 
 MIN_SECONDS = 0.4
@@ -29,8 +34,10 @@ MAX_SECONDS = 15
 MAX_TEXT_LENGTH = 120
 
 # What Whisper tends to write when it is given noise or silence instead of speech.
+# (compared after punctuation is turned into spaces, so "that's it" is written "that s it")
 _NOISE_PHRASES = {"you", "the", "so", "bye", "bye bye", "thanks", "thank you", "thank you very much",
-                  "thanks for watching", "thank you for watching", "please subscribe"}
+                  "thanks for watching", "thank you for watching", "please subscribe", "and that s it", "that s it",
+                  "and that s all", "that s all", "thanks for listening", "i m sorry", "okay", "ok", "oh", "uh", "um", "hmm"}
 _PLAIN = {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-", "\u2014": "-", "\u2026": "..."}
 
 _INDEX_STEP = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8]
@@ -101,7 +108,9 @@ def whisper_transcribe(wav_bytes):
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key and "api.openai.com" in WHISPER_URL:
         raise VoiceError("Speech-to-text is not set up on the Pi. Set OPENAI_API_KEY and restart the bridge.", "stt_not_configured")
-    fields = {"model": WHISPER_MODEL, "response_format": "json", "temperature": "0"}
+    # verbose_json carries the per-phrase confidence; the newer gpt-4o transcription models only answer in plain json.
+    response_format = "verbose_json" if WHISPER_MODEL.startswith("whisper") else "json"
+    fields = {"model": WHISPER_MODEL, "response_format": response_format, "temperature": "0"}
     if WHISPER_LANGUAGE:
         fields["language"] = WHISPER_LANGUAGE
     if WHISPER_PROMPT:
@@ -113,7 +122,7 @@ def whisper_transcribe(wav_bytes):
     request = urllib.request.Request(f"{WHISPER_URL}/audio/transcriptions", data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=WHISPER_TIMEOUT_SECONDS) as response:
-            return str(json.loads(response.read().decode("utf-8")).get("text", ""))
+            return _confident_text(json.loads(response.read().decode("utf-8")))
     except urllib.error.HTTPError as error:
         try:
             detail = json.loads(error.read().decode("utf-8")).get("error", {}).get("message", "")
@@ -124,6 +133,25 @@ def whisper_transcribe(wav_bytes):
         raise VoiceError("Could not reach the speech service. Check the Pi's internet connection.", "stt_unreachable") from error
     except ValueError as error:
         raise VoiceError("The speech service sent an answer I could not read.", "stt_error") from error
+
+
+def _confident_text(body):
+    """The text of the phrases Whisper is sure about. Raises VoiceError when it was not sure of any."""
+    segments = body.get("segments") if isinstance(body, dict) else None
+    if not isinstance(segments, list) or not segments:
+        return str(body.get("text", "")) if isinstance(body, dict) else ""
+    sure = [segment for segment in segments
+            if segment.get("no_speech_prob", 0) <= MAX_NO_SPEECH and segment.get("avg_logprob", 0) >= MIN_AVG_LOGPROB]
+    notes = []
+    for segment in segments:
+        dropped = "" if segment in sure else " DROPPED"
+        notes.append(f"[no_speech {segment.get('no_speech_prob', 0):.2f}, logprob {segment.get('avg_logprob', 0):.2f}{dropped}]")
+    print("Whisper confidence: " + ", ".join(notes))
+    if not sure:
+        if all(segment.get("no_speech_prob", 0) > MAX_NO_SPEECH for segment in segments):
+            raise VoiceError("I did not hear any words. Try again, closer to the mic.", "silence")
+        raise VoiceError("I could not understand that. Say the task again, slowly and clearly.", "unclear")
+    return " ".join(str(segment.get("text", "")).strip() for segment in sure)
 
 
 def to_watch_text(text):
@@ -157,7 +185,7 @@ def check_transcript(text):
     return text
 
 
-def transcribe_recording(adpcm, sample_rate, total_samples, predictor, index, transcribe=None):
+def transcribe_recording(adpcm, sample_rate, total_samples, predictor, index, transcribe=None, on_audio=None):
     """Turn one received recording into task text. Raises VoiceError with a message for the watch."""
     if not 4000 <= sample_rate <= 48000:
         raise VoiceError("The audio format was not recognized.", "bad_format")
@@ -169,5 +197,7 @@ def transcribe_recording(adpcm, sample_rate, total_samples, predictor, index, tr
     if len(adpcm) < (total_samples + 1) // 2:
         raise VoiceError("Part of the audio was lost on the way. Please try again.", "audio_lost")
     pcm = adpcm_decode(adpcm, total_samples, predictor, index)
+    if on_audio is not None:
+        on_audio(pcm)  # for example to keep a copy of what the speech service is about to hear
     text = check_transcript(clean_transcript((transcribe or whisper_transcribe)(pcm_to_wav(pcm, sample_rate))))
     return text, pcm

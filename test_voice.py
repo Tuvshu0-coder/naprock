@@ -4,6 +4,7 @@ Run with:  python -m unittest test_voice
 """
 
 import io
+import json
 import struct
 import unittest
 import urllib.error
@@ -44,9 +45,23 @@ class TranscriptTests(unittest.TestCase):
             self.assertIn("did not hear", self.assert_refused("silence", heard=heard))
 
     def test_unclear_audio_is_reported(self):
-        # Stock phrases and an echo of the prompt are what Whisper produces from noise.
-        for heard in ("Thank you.", "you", "Thanks for watching!", "Check the pressure gauge on pump three.", "A short work task"):
+        # Stock phrases are what Whisper produces from noise.
+        for heard in ("Thank you.", "you", "Thanks for watching!", "And that's it.", "That's it", "Okay"):
             self.assertIn("could not understand", self.assert_refused("unclear", heard=heard))
+
+    def test_an_echo_of_a_hint_that_was_set_is_refused(self):
+        hint = "A short work task, for example: Check the pressure gauge on pump three."
+        with mock.patch.object(voice, "WHISPER_PROMPT", hint):
+            for heard in ("Check the pressure gauge on pump three.", "A short work task"):
+                self.assertIn("could not understand", self.assert_refused("unclear", heard=heard))
+
+    def test_a_task_that_resembles_the_old_example_is_accepted(self):
+        # Without a hint nothing is echoed, so a genuine task about a pressure gauge must go through.
+        text, _ = transcribe(heard="Check the pressure gauge on pump two.")
+        self.assertEqual(text, "Check the pressure gauge on pump two")
+
+    def test_no_hint_is_sent_by_default(self):
+        self.assertEqual(voice.WHISPER_PROMPT, "")
 
     def test_text_the_watch_cannot_show_is_refused(self):
         self.assertIn("English", self.assert_refused("unclear", heard="Проверить насос"))
@@ -113,6 +128,51 @@ class SpeechServiceTests(unittest.TestCase):
             self.assertEqual(voice.whisper_transcribe(b"RIFF"), "Open the valve.")
         self.assertEqual(urlopen.call_args[0][0].full_url, "http://127.0.0.1:9000/v1/audio/transcriptions")
         self.assertNotIn("Authorization", urlopen.call_args[0][0].headers)
+
+
+class ConfidenceTests(unittest.TestCase):
+    """Whisper reports how sure it is of each phrase; unsure phrases must not become tasks."""
+
+    class Reply(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    def transcribe(self, segments, text="x"):
+        body = json.dumps({"text": text, "segments": segments}).encode()
+        with mock.patch.dict(voice.os.environ, {"OPENAI_API_KEY": "key"}):
+            with mock.patch.object(voice.urllib.request, "urlopen", return_value=self.Reply(body)) as urlopen:
+                return voice.whisper_transcribe(b"RIFF"), urlopen
+
+    def segment(self, text, no_speech=0.05, logprob=-0.3):
+        return {"text": text, "no_speech_prob": no_speech, "avg_logprob": logprob}
+
+    def test_a_sure_phrase_is_kept(self):
+        text, urlopen = self.transcribe([self.segment(" Open the valve")])
+        self.assertEqual(text, "Open the valve")
+        sent = urlopen.call_args[0][0].data
+        self.assertIn(b"verbose_json", sent)
+        self.assertNotIn(b'name="prompt"', sent)
+
+    def test_only_the_sure_phrases_are_kept(self):
+        text, _ = self.transcribe([self.segment("Open the valve"), self.segment("Thank you.", no_speech=0.9)])
+        self.assertEqual(text, "Open the valve")
+
+    def test_phrases_that_sound_like_silence_are_refused(self):
+        with self.assertRaises(voice.VoiceError) as caught:
+            self.transcribe([self.segment("Check the pressure gauge", no_speech=0.8)])
+        self.assertEqual(caught.exception.code, "silence")
+
+    def test_a_guess_is_refused(self):
+        with self.assertRaises(voice.VoiceError) as caught:
+            self.transcribe([self.segment("And that is it", logprob=-1.8)])
+        self.assertEqual(caught.exception.code, "unclear")
+
+    def test_an_answer_without_confidence_numbers_is_still_used(self):
+        text, _ = self.transcribe(None, text="Open the valve.")
+        self.assertEqual(text, "Open the valve.")
 
 
 if __name__ == "__main__":
