@@ -224,6 +224,8 @@ static size_t recCapacity = 0;
 static volatile size_t recCount = 0;
 static volatile bool recRunning = false;
 static volatile bool recStopRequested = false;
+static volatile bool recReady = false;       // the recording task has the ADC running
+static volatile bool recOpenFailed = false;  // the recording task could not start the ADC
 static volatile uint16_t recLevel = 0;  // peak-to-peak counts over the last 100 ms, for the level meter
 static int32_t decimateSum = 0;
 static uint8_t decimateCount = 0;
@@ -240,6 +242,7 @@ static size_t voiceOffset = 0;
 static uint16_t voiceSeq = 0;
 static uint8_t voiceLastPercent = 255;
 static uint32_t voiceProgressAt = 0;
+static uint32_t voiceLastPacketAt = 0;
 static uint32_t voiceWaitSince = 0;
 static uint32_t voiceUiAt = 0;
 static char voiceText[124] = "";
@@ -1052,6 +1055,14 @@ static void releaseVoice() {
 }
 
 static void recordTask(void *) {
+  // The ADC driver takes a lock when it starts and FreeRTOS only lets the task that took a lock release it, so
+  // this task starts the ADC and also stops it. Starting it from another task made the watch restart on Done.
+  if (!adcOpen()) {
+    recOpenFailed = true;
+    recRunning = false;
+    vTaskDelete(nullptr);
+  }
+  recReady = true;
   int16_t levelMin = 4095;
   int16_t levelMax = 0;
   size_t levelSamples = 0;
@@ -1090,12 +1101,18 @@ static bool startRecording() {
   recCount = 0;
   recLevel = 0;
   recStopRequested = false;
-  if (!adcOpen()) {
+  recReady = false;
+  recOpenFailed = false;
+  recRunning = true;
+  xTaskCreatePinnedToCore(recordTask, "mic", 6144, nullptr, 2, nullptr, 1);
+  // Wait until the task reports that it is listening (or that it could not start the ADC).
+  for (uint32_t waited = 0; !recReady && !recOpenFailed && waited < 1000; waited += 5) delay(5);
+  if (!recReady) {
+    recStopRequested = true;
+    for (uint32_t waited = 0; recRunning && waited < 500; waited += 5) delay(5);
     releaseRecording();
     return false;
   }
-  recRunning = true;
-  xTaskCreatePinnedToCore(recordTask, "mic", 6144, nullptr, 2, nullptr, 1);
   Serial.printf("Recording started, up to %u s (free heap %u bytes)\n", (unsigned)(recCapacity / MIC_SAMPLE_RATE), (unsigned)ESP.getFreeHeap());
   return true;
 }
@@ -1250,12 +1267,15 @@ static size_t audioPayloadSize() {
 
 // Sends a few packets per pass so the screen stays responsive. A notification that does not fit in the
 // Bluetooth queue is simply retried on the next pass.
+static const uint32_t VOICE_PACKET_GAP_MS = 12;
+
 static void voiceSendTick() {
   if (voicePhase != VOICE_SENDING) return;
   uint32_t now = millis();
   size_t payloadSize = audioPayloadSize();
   uint8_t packet[200];
-  for (uint8_t burst = 0; burst < 8 && voicePhase == VOICE_SENDING; burst++) {
+  bool paced = voiceStage != 0 && now - voiceLastPacketAt < VOICE_PACKET_GAP_MS;
+  for (uint8_t burst = 0; burst < 1 && !paced && voicePhase == VOICE_SENDING; burst++) {
     size_t length = 0;
     if (voiceStage == 0) {
       packet[0] = 1;
@@ -1288,12 +1308,15 @@ static void voiceSendTick() {
     audioTxCharacteristic->setValue(packet, length);
     if (!audioTxCharacteristic->notify()) break;
     voiceProgressAt = now;
+    voiceLastPacketAt = now;
     if (voiceStage == 0) {
       voiceStage = 1;
     } else if (voiceStage == 1) {
       voiceOffset += length - 4;
       voiceSeq++;
     } else {
+      Serial.printf("Voice: sent %u bytes in %u packets, waiting for the transcript (free heap %u)\n",
+                    (unsigned)voiceAdpcmBytes, (unsigned)voiceSeq, (unsigned)ESP.getFreeHeap());
       voiceStage = 3;
       voicePhase = VOICE_WAITING;
       voiceWaitSince = now;
@@ -1626,6 +1649,7 @@ static void handleMessage(const std::string &line) {
     Serial.println("Ignoring a malformed reply from the bridge");
     return;
   }
+  Serial.printf("From bridge: %.120s\n", line.c_str());
   const char *type = doc["t"] | "";
   if (strcmp(type, "hello") == 0) {
     // The bridge just subscribed to us, so this is the moment to ask who is linked.
@@ -1635,7 +1659,10 @@ static void handleMessage(const std::string &line) {
   }
   if (strcmp(type, "transcript") == 0) {
     // The bridge finished turning the recording into text (or could not).
-    if (voicePhase != VOICE_WAITING || (uint32_t)(doc["sid"] | 0) != voiceSid) return;
+    if (voicePhase != VOICE_WAITING || (uint32_t)(doc["sid"] | 0) != voiceSid) {
+      Serial.printf("Ignoring a transcript: voice phase %d, its session %u, expected %u\n", (int)voicePhase, (unsigned)(doc["sid"] | 0), (unsigned)voiceSid);
+      return;
+    }
     voicePhase = VOICE_IDLE;
     const char *text = doc["text"] | "";
     if ((doc["ok"] | false) && text[0]) {
@@ -1907,7 +1934,8 @@ class ServerCallback : public NimBLEServerCallbacks {
     rxAccum.clear();
     rxLineCount = 0;
     xSemaphoreGive(rxMutex);
-    Serial.println("Pi disconnected, advertising again");
+    Serial.printf("Pi disconnected (reason 0x%02X), advertising again. Voice phase %d, free heap %u\n",
+                  reason & 0xFF, (int)voicePhase, (unsigned)ESP.getFreeHeap());
     NimBLEDevice::startAdvertising();
   }
 };
@@ -1916,6 +1944,13 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("Starting BandFlow wristband BLE...");
+  // If the watch seems to disconnect, this line says whether it actually restarted and why.
+  esp_reset_reason_t resetReason = esp_reset_reason();
+  const char *resetName = resetReason == ESP_RST_POWERON ? "power on" : resetReason == ESP_RST_SW ? "software reset"
+                        : resetReason == ESP_RST_PANIC ? "CRASH (panic)" : resetReason == ESP_RST_INT_WDT ? "CRASH (interrupt watchdog)"
+                        : resetReason == ESP_RST_TASK_WDT ? "CRASH (task watchdog)" : resetReason == ESP_RST_WDT ? "CRASH (watchdog)"
+                        : resetReason == ESP_RST_BROWNOUT ? "BROWNOUT (not enough power)" : resetReason == ESP_RST_USB ? "USB reset" : "other";
+  Serial.printf("Reset reason: %d (%s)\n", (int)resetReason, resetName);
 
   rxMutex = xSemaphoreCreateMutex();
   pinMode(VIBRATION_PIN, OUTPUT);
@@ -1977,4 +2012,4 @@ void loop() {
   lv_timer_handler();
   delay(5);
 }
-//sergei gomo
+//sergei gomo 3

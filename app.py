@@ -166,7 +166,13 @@ class BandFlowBle:
     async def _connection_loop(self):
         global _latest_status
         while True:
-            device = await self._find_band()
+            try:
+                device = await self._find_band()
+            except Exception as error:
+                # For example Bluetooth switched off in Windows. Without this the thread would die and never recover.
+                print(f"Cannot scan for BandFlow: {error}. Turn Bluetooth on; trying again...")
+                await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+                continue
             if device is None:
                 await asyncio.sleep(RECONNECT_DELAY_SECONDS)
                 continue
@@ -299,10 +305,16 @@ class BandFlowBle:
         except Exception as error:  # never leave the watch waiting
             print(f"Voice request crashed: {error!r}")
             reply.update(ok=False, error="Something went wrong while understanding that.", code="stt_error")
-        try:
-            await self._send_rpc(reply)
-        except Exception as error:
-            print(f"Could not send the transcript to the band: {error}")
+        # The reply is the last step the worker is waiting on, so it is worth a few tries and a clear log.
+        for attempt in range(1, 4):
+            try:
+                print(f"Sending the answer to the band (try {attempt})...")
+                await asyncio.wait_for(self._send_rpc(reply), timeout=10)
+                print("Answer sent to the band.")
+                break
+            except Exception as error:
+                print(f"Could not send the answer to the band (try {attempt} of 3): {error!r}")
+                await asyncio.sleep(1)
 
     async def _handle_band_message(self, line):
         try:
