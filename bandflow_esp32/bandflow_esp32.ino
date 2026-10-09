@@ -14,6 +14,8 @@
 #include <ArduinoJson.h>
 #include <string>
 #include <esp_adc/adc_continuous.h>
+#include <driver/gpio.h>
+#include <driver/rtc_io.h>
 #include "touch.h"
 #include "adpcm.h"
 
@@ -28,9 +30,11 @@
 
 // Microphone: the signal must go to an ADC1 pin (GPIO 1-10). GPIO 45 has no ADC, and 1, 3, 8, 9, 10 are
 // already used by the display and touch panel, so this leaves 2, 4, 5, 6 or 7.
-#define MIC_PIN                4
+#define MIC_PIN                7
 #define MIC_SAMPLE_RATE        8000
-#define MIC_MIN_PEAK           12  // quietest usable speech peak, in 12-bit ADC counts after removing the DC level
+#define MIC_OVERSAMPLE         4   // the ADC runs 4x faster and each group of 4 readings is averaged (like the Uno test)
+#define MIC_SOFT_BIAS          1   // 1 = hold the pin at half the supply with the chip's own pull-up and pull-down
+#define MIC_MIN_PEAK           8   // quietest usable speech peak, in 12-bit ADC counts after removing the DC level
 
 // These match the worker screens in the app (WorkerDashboard.tsx / TaskDetail.tsx, dark theme).
 #define COLOR_BG            0x07111F
@@ -221,6 +225,8 @@ static volatile size_t recCount = 0;
 static volatile bool recRunning = false;
 static volatile bool recStopRequested = false;
 static volatile uint16_t recLevel = 0;  // peak-to-peak counts over the last 100 ms, for the level meter
+static int32_t decimateSum = 0;
+static uint8_t decimateCount = 0;
 
 // Voice-add flow: record -> compress -> send -> bridge transcribes -> confirm -> add
 static VoicePhase voicePhase = VOICE_IDLE;
@@ -903,10 +909,25 @@ static void runHaptics() {
 
 // ---- Microphone -------------------------------------------------------------------------------------------------
 
+// With only a coupling capacitor in front of the pin, nothing sets the resting voltage of the signal. The chip's
+// own pull-up and pull-down resistors (about 45k each) together hold it near half the supply, so no bias
+// resistors are needed. The power-on check in the Serial Monitor shows whether it took effect.
+static void micSoftBias() {
+#if MIC_SOFT_BIAS
+  gpio_num_t pin = (gpio_num_t)MIC_PIN;
+  if (rtc_gpio_is_valid_gpio(pin)) {
+    rtc_gpio_pullup_en(pin);
+    rtc_gpio_pulldown_en(pin);
+  }
+  gpio_pullup_en(pin);
+  gpio_pulldown_en(pin);
+#endif
+}
+
 static bool adcOpen() {
   adc_continuous_handle_cfg_t handleConfig = {};
-  handleConfig.max_store_buf_size = 4096;
-  handleConfig.conv_frame_size = 256;
+  handleConfig.max_store_buf_size = 8192;
+  handleConfig.conv_frame_size = 1024;
   if (adc_continuous_new_handle(&handleConfig, &adcHandle) != ESP_OK) return false;
 
   adc_digi_pattern_config_t pattern = {};
@@ -917,7 +938,7 @@ static bool adcOpen() {
   adc_continuous_config_t config = {};
   config.pattern_num = 1;
   config.adc_pattern = &pattern;
-  config.sample_freq_hz = MIC_SAMPLE_RATE;
+  config.sample_freq_hz = MIC_SAMPLE_RATE * MIC_OVERSAMPLE;
   config.conv_mode = ADC_CONV_SINGLE_UNIT_1;
   config.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
   if (adc_continuous_config(adcHandle, &config) != ESP_OK || adc_continuous_start(adcHandle) != ESP_OK) {
@@ -925,6 +946,9 @@ static bool adcOpen() {
     adcHandle = nullptr;
     return false;
   }
+  decimateSum = 0;
+  decimateCount = 0;
+  micSoftBias();  // the driver resets the pin when it starts, so this comes last
   return true;
 }
 
@@ -935,16 +959,23 @@ static void adcClose() {
   adcHandle = nullptr;
 }
 
-// Reads one DMA frame (up to 64 samples) and returns how many 12-bit samples were stored.
+// Reads one DMA frame and returns how many 8 kHz samples were stored. The ADC runs four times faster than the
+// audio rate and every group of four readings is averaged, as the tested Uno sketch did: it halves the noise and
+// stops sounds above 4 kHz from folding back into the recording.
 static size_t adcReadSamples(int16_t *out, size_t maxCount, uint32_t timeoutMs) {
-  uint8_t raw[256];
+  uint8_t raw[1024];
   uint32_t received = 0;
   if (adc_continuous_read(adcHandle, raw, sizeof(raw), &received, timeoutMs) != ESP_OK) return 0;
   size_t count = 0;
-  for (uint32_t offset = 0; offset + SOC_ADC_DIGI_RESULT_BYTES <= received && count < maxCount; offset += SOC_ADC_DIGI_RESULT_BYTES) {
+  for (uint32_t offset = 0; offset + SOC_ADC_DIGI_RESULT_BYTES <= received; offset += SOC_ADC_DIGI_RESULT_BYTES) {
     adc_digi_output_data_t *sample = (adc_digi_output_data_t *)&raw[offset];
     if (sample->type2.channel != micChannel) continue;
-    out[count++] = (int16_t)sample->type2.data;
+    decimateSum += sample->type2.data;
+    if (++decimateCount == MIC_OVERSAMPLE) {
+      if (count < maxCount) out[count++] = (int16_t)((decimateSum + MIC_OVERSAMPLE / 2) / MIC_OVERSAMPLE);
+      decimateSum = 0;
+      decimateCount = 0;
+    }
   }
   return count;
 }
@@ -966,7 +997,7 @@ static void micSelfTest() {
   while (counted < 4000 && millis() - startedAt < 1500) {
     size_t got = adcReadSamples(samples, 64, 50);
     for (size_t index = 0; index < got; index++, seen++) {
-      if (seen < 400) continue;  // the first 50 ms of a capture is unreliable
+      if (seen < MIC_SAMPLE_RATE / 5) continue;  // wait 200 ms for the coupling capacitor to settle
       if (samples[index] < minimum) minimum = samples[index];
       if (samples[index] > maximum) maximum = samples[index];
       sum += samples[index];
@@ -980,10 +1011,10 @@ static void micSelfTest() {
   }
   int average = (int)(sum / counted);
   Serial.printf("Microphone check on GPIO %d: average %d of 4095, quiet noise swing %d counts\n", MIC_PIN, average, (int)(maximum - minimum));
-  if (average < 300) Serial.println("  -> reads near 0 V: the mic is not connected, or the signal has no bias (see the two bias resistors in the wiring notes)");
-  else if (average > 3800) Serial.println("  -> reads near 3.3 V: check the wiring and the bias resistors");
+  if (average < 300) Serial.println("  -> reads near 0 V: the mic is not connected or not powered, or the chip's own bias did not take effect. Fix: add two equal resistors (1k is fine), one from 3V3 to the pin and one from the pin to GND");
+  else if (average > 3500) Serial.println("  -> reads close to the top of the ADC range, so loud sounds would clip. Check the wiring (with no capacitor, add another 1k in series with R1)");
   else if (maximum - minimum > 400) Serial.println("  -> very noisy: check the ground connection and keep the mic wires short");
-  else Serial.println("  -> the bias level looks right");
+  else Serial.println("  -> the DC level looks right");
 }
 
 static void micInit() {
@@ -1064,7 +1095,7 @@ static bool startRecording() {
     return false;
   }
   recRunning = true;
-  xTaskCreatePinnedToCore(recordTask, "mic", 4096, nullptr, 2, nullptr, 1);
+  xTaskCreatePinnedToCore(recordTask, "mic", 6144, nullptr, 2, nullptr, 1);
   Serial.printf("Recording started, up to %u s (free heap %u bytes)\n", (unsigned)(recCapacity / MIC_SAMPLE_RATE), (unsigned)ESP.getFreeHeap());
   return true;
 }
@@ -1079,7 +1110,7 @@ static uint32_t peakHistogram[2048];
 // Cleans the recording the same way as the tested Uno script (remove the DC level, then scale to a healthy
 // volume), then compresses it. Returns false with a message for the screen when there was no usable sound.
 static bool prepareVoice(char *error, size_t errorSize) {
-  const size_t settle = MIC_SAMPLE_RATE / 20;
+  const size_t settle = MIC_SAMPLE_RATE / 5;  // drop the first 200 ms, while the coupling capacitor settles
   if (recCount < settle + MIC_SAMPLE_RATE * 4 / 10) {
     strlcpy(error, "That was too short. Tap + and speak.", errorSize);
     return false;

@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 545" width="780" height="545" font-family="Segoe UI, Arial, sans-serif">
+  <title>BandFlow microphone circuit using only 1k resistors</title>
+  <rect width="780" height="545" fill="#ffffff"/>
+
+  <text x="24" y="30" font-size="20" font-weight="700" fill="#1b2b3a">Microphone circuit with only 1k resistors</text>
+  <g font-size="13">
+    <line x1="24" y1="48" x2="52" y2="48" stroke="#1b2b3a" stroke-width="3"/>
+    <text x="60" y="52" fill="#1b2b3a">keep</text>
+    <line x1="110" y1="48" x2="138" y2="48" stroke="#14804a" stroke-width="3"/>
+    <text x="146" y="52" fill="#14804a">add or change</text>
+    <text x="270" y="52" fill="#c0392b">remove: C1, R2 and R3 are not needed</text>
+  </g>
+
+  <!-- 3V3 rail from the ESP32 3V3 pin to the top of R1 -->
+  <g stroke="#14804a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <line class="w" x1="190" y1="90" x2="680" y2="90"/>
+    <line class="w" x1="680" y1="90" x2="680" y2="200"/>
+  </g>
+  <text x="212" y="76" font-size="16" font-weight="700" fill="#14804a">3V3</text>
+  <text x="258" y="76" font-size="13" fill="#14804a">from the ESP32's 3V3 pin</text>
+
+  <!-- R1 = four 1k resistors in series (green: changed from one 10k) -->
+  <g stroke="#14804a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <polyline class="r" points="190,90 190,95 198,99 182,107 198,115 190,119 190,127 190,132 198,136 182,144 198,152 190,156 190,164 190,169 198,173 182,181 198,189 190,193 190,201 190,206 198,210 182,218 198,226 190,230 190,238 190,255"/>
+  </g>
+  <text x="222" y="130" font-size="16" font-weight="700" fill="#14804a">R1</text>
+  <text x="222" y="150" font-size="14" fill="#14804a">4 &#215; 1k in series</text>
+  <text x="222" y="168" font-size="14" fill="#14804a">= 4k</text>
+
+  <!-- electret microphone: capsule, back plate, + lead to node A, - lead to GND -->
+  <g stroke="#1b2b3a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <circle class="s" cx="78" cy="345" r="38" fill="#e9e4cf"/>
+    <rect class="s" x="124" y="300" width="14" height="90" fill="#e9e4cf"/>
+    <line class="w" x1="131" y1="300" x2="131" y2="255"/>
+    <line class="w" x1="131" y1="255" x2="190" y2="255"/>
+    <line class="w" x1="131" y1="390" x2="131" y2="480"/>
+  </g>
+  <text x="104" y="284" font-size="22" font-weight="700" fill="#c0392b" text-anchor="end">+</text>
+  <text x="108" y="430" font-size="26" font-weight="700" fill="#1b2b3a" text-anchor="end">&#8722;</text>
+  <text x="78" y="408" font-size="13" fill="#1b2b3a" text-anchor="middle">electret mic</text>
+
+  <!-- node A goes straight to GPIO 4 (green: changed) -->
+  <g stroke="#14804a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <line class="w" x1="190" y1="255" x2="590" y2="255"/>
+  </g>
+  <text x="390" y="244" font-size="13" fill="#14804a" text-anchor="middle">signal: straight to the pin</text>
+  <text x="390" y="278" font-size="12" fill="#14804a" text-anchor="middle">no capacitor, no divider</text>
+
+  <!-- ESP32 board: 3V3 pin on top, GPIO 4 on the left, GND on the bottom -->
+  <rect x="590" y="200" width="180" height="110" rx="8" fill="#eef3f8" stroke="#1b2b3a" stroke-width="3"/>
+  <text x="680" y="222" font-size="13" fill="#14804a" text-anchor="middle" font-weight="700">3V3 pin</text>
+  <text x="680" y="257" font-size="16" font-weight="700" fill="#1b2b3a" text-anchor="middle">ESP32-S3</text>
+  <text x="600" y="276" font-size="13" fill="#1b2b3a">GPIO 4</text>
+  <text x="680" y="299" font-size="13" fill="#1b2b3a" text-anchor="middle" font-weight="700">GND pin</text>
+
+  <!-- ground rail -->
+  <g stroke="#1b2b3a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <line class="w" x1="131" y1="480" x2="680" y2="480"/>
+    <line class="w" x1="680" y1="480" x2="680" y2="310"/>
+    <line class="w" x1="290" y1="480" x2="290" y2="496"/>
+    <line class="s" x1="270" y1="496" x2="310" y2="496"/>
+    <line class="s" x1="279" y1="506" x2="301" y2="506"/>
+    <line class="s" x1="286" y1="516" x2="294" y2="516"/>
+  </g>
+  <text x="131" y="504" font-size="16" font-weight="700" fill="#1b2b3a">GND</text>
+
+  <!-- junction dots -->
+  <g fill="#1b2b3a">
+    <circle cx="131" cy="480" r="6"/>
+  </g>
+  <g fill="#14804a">
+    <circle cx="190" cy="255" r="7"/>
+    <circle cx="190" cy="90" r="6"/>
+  </g>
+  <text x="176" y="248" font-size="12" font-weight="700" fill="#14804a" text-anchor="end">A</text>
+
+  <!-- notes -->
+  <g>
+    <rect x="262" y="318" width="390" height="110" rx="8" fill="#e8f5ee" stroke="#14804a" stroke-width="2"/>
+    <text x="457" y="340" font-size="14" font-weight="700" fill="#14804a" text-anchor="middle">Why this works</text>
+    <text x="457" y="360" font-size="12" fill="#14804a" text-anchor="middle">Point A rests at roughly 1.3 to 2.1 V, and the sound is a tiny</text>
+    <text x="457" y="376" font-size="12" fill="#14804a" text-anchor="middle">wiggle on top of it. The ADC reads that directly and the firmware</text>
+    <text x="457" y="392" font-size="12" fill="#14804a" text-anchor="middle">removes the resting level. The power-on check in the Serial Monitor</text>
+    <text x="457" y="408" font-size="12" fill="#14804a" text-anchor="middle">should print an average between about 1000 and 3400.</text>
+  </g>
+  <text x="340" y="506" font-size="12" fill="#1b2b3a">If it prints more than 3500, add one more 1k in series with R1.</text>
+  <text x="340" y="522" font-size="12" fill="#1b2b3a">If it prints less than 500, take one 1k out of R1.</text>
+</svg>

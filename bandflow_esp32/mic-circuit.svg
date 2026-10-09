@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 545" width="780" height="545" font-family="Segoe UI, Arial, sans-serif">
+  <title>BandFlow microphone circuit with bias resistors</title>
+  <rect width="780" height="545" fill="#ffffff"/>
+
+  <text x="24" y="30" font-size="20" font-weight="700" fill="#1b2b3a">Microphone circuit for the ESP32-S3</text>
+  <g font-size="13">
+    <line x1="24" y1="48" x2="52" y2="48" stroke="#1b2b3a" stroke-width="3"/>
+    <text x="60" y="52" fill="#1b2b3a">from your circuit</text>
+    <line x1="190" y1="48" x2="218" y2="48" stroke="#14804a" stroke-width="3"/>
+    <text x="226" y="52" fill="#14804a">add or change</text>
+  </g>
+
+  <!-- 3V3 rail: from the ESP32 3V3 pin across to R1 and R2 (green: changed from +5V) -->
+  <g stroke="#14804a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <line class="w" x1="190" y1="90" x2="680" y2="90"/>
+    <line class="w" x1="680" y1="90" x2="680" y2="200"/>
+  </g>
+  <text x="190" y="76" font-size="16" font-weight="700" fill="#14804a">3V3</text>
+  <text x="236" y="76" font-size="13" fill="#14804a">from the ESP32's 3V3 pin (was +5V)</text>
+
+  <!-- R1 (yours): 3V3 to node A -->
+  <g stroke="#1b2b3a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <polyline class="r" points="190,90 190,125 190,133 200,141 180,157 200,173 180,189 200,205 190,213 190,225 190,255"/>
+  </g>
+  <text x="212" y="170" font-size="16" font-weight="700" fill="#1b2b3a">R1</text>
+  <text x="212" y="190" font-size="14" fill="#1b2b3a">10k</text>
+
+  <!-- electret microphone (yours): capsule, back plate, + lead to node A, - lead to GND -->
+  <g stroke="#1b2b3a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <circle class="s" cx="78" cy="345" r="38" fill="#e9e4cf"/>
+    <rect class="s" x="124" y="300" width="14" height="90" fill="#e9e4cf"/>
+    <line class="w" x1="131" y1="300" x2="131" y2="255"/>
+    <line class="w" x1="131" y1="255" x2="190" y2="255"/>
+    <line class="w" x1="131" y1="390" x2="131" y2="480"/>
+  </g>
+  <text x="104" y="284" font-size="22" font-weight="700" fill="#c0392b" text-anchor="end">+</text>
+  <text x="108" y="430" font-size="26" font-weight="700" fill="#1b2b3a" text-anchor="end">&#8722;</text>
+  <text x="78" y="408" font-size="13" fill="#1b2b3a" text-anchor="middle">electret mic</text>
+
+  <!-- C1 (yours): non-polarized, A to B -->
+  <g stroke="#1b2b3a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <line class="w" x1="190" y1="255" x2="290" y2="255"/>
+    <line class="s" x1="290" y1="232" x2="290" y2="278"/>
+    <line class="s" x1="308" y1="232" x2="308" y2="278"/>
+    <line class="w" x1="308" y1="255" x2="420" y2="255"/>
+  </g>
+  <text x="299" y="212" font-size="16" font-weight="700" fill="#1b2b3a" text-anchor="middle">C1</text>
+  <text x="299" y="300" font-size="14" fill="#1b2b3a" text-anchor="middle">1 &#181;F</text>
+  <text x="299" y="317" font-size="12" fill="#1b2b3a" text-anchor="middle">ceramic or film</text>
+
+  <!-- R2: 3V3 to node B (new) -->
+  <g stroke="#14804a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <polyline class="r" points="420,90 420,125 420,133 430,141 410,157 430,173 410,189 430,205 420,213 420,225 420,255"/>
+  </g>
+  <text x="442" y="170" font-size="16" font-weight="700" fill="#14804a">R2</text>
+  <text x="442" y="190" font-size="14" fill="#14804a">10k  (new)</text>
+
+  <!-- R3: node B to GND (new) -->
+  <g stroke="#14804a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <polyline class="r" points="420,255 420,290 420,298 430,306 410,322 430,338 410,354 430,370 420,378 420,390 420,480"/>
+  </g>
+  <text x="442" y="335" font-size="16" font-weight="700" fill="#14804a">R3</text>
+  <text x="442" y="355" font-size="14" fill="#14804a">10k  (new)</text>
+
+  <!-- signal from node B to the ESP32 -->
+  <g stroke="#1b2b3a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <line class="w" x1="420" y1="255" x2="590" y2="255"/>
+  </g>
+  <text x="505" y="246" font-size="13" fill="#1b2b3a" text-anchor="middle">signal</text>
+
+  <!-- ESP32 board: 3V3 pin on top, GPIO 4 on the left, GND on the bottom -->
+  <rect x="590" y="200" width="180" height="110" rx="8" fill="#eef3f8" stroke="#1b2b3a" stroke-width="3"/>
+  <text x="680" y="222" font-size="13" fill="#14804a" text-anchor="middle" font-weight="700">3V3 pin</text>
+  <text x="680" y="257" font-size="16" font-weight="700" fill="#1b2b3a" text-anchor="middle">ESP32-S3</text>
+  <text x="600" y="276" font-size="13" fill="#1b2b3a">GPIO 4</text>
+  <text x="680" y="299" font-size="13" fill="#1b2b3a" text-anchor="middle" font-weight="700">GND pin</text>
+
+  <!-- ground rail -->
+  <g stroke="#1b2b3a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <line class="w" x1="131" y1="480" x2="680" y2="480"/>
+    <line class="w" x1="680" y1="480" x2="680" y2="310"/>
+    <line class="w" x1="290" y1="480" x2="290" y2="496"/>
+    <line class="s" x1="270" y1="496" x2="310" y2="496"/>
+    <line class="s" x1="279" y1="506" x2="301" y2="506"/>
+    <line class="s" x1="286" y1="516" x2="294" y2="516"/>
+  </g>
+  <text x="131" y="504" font-size="16" font-weight="700" fill="#1b2b3a">GND</text>
+
+  <!-- junction dots: wires that are joined -->
+  <g fill="#1b2b3a">
+    <circle cx="190" cy="255" r="6"/>
+    <circle cx="131" cy="480" r="6"/>
+    <circle cx="190" cy="90" r="6" fill="#14804a"/>
+  </g>
+  <g fill="#14804a">
+    <circle cx="420" cy="90" r="6"/>
+    <circle cx="420" cy="255" r="7"/>
+    <circle cx="420" cy="480" r="6"/>
+  </g>
+  <text x="424" y="248" font-size="12" font-weight="700" fill="#14804a" text-anchor="start" dx="8" dy="-6">B</text>
+  <text x="176" y="248" font-size="12" font-weight="700" fill="#1b2b3a" text-anchor="end">A</text>
+
+  <!-- notes -->
+  <g>
+    <rect x="452" y="392" width="216" height="62" rx="8" fill="#e8f5ee" stroke="#14804a" stroke-width="2"/>
+    <text x="560" y="412" font-size="14" font-weight="700" fill="#14804a" text-anchor="middle">Bias point &#8776; 1.65 V</text>
+    <text x="560" y="430" font-size="12" fill="#14804a" text-anchor="middle">R2 and R3 hold the signal in the</text>
+    <text x="560" y="445" font-size="12" fill="#14804a" text-anchor="middle">middle of the ADC range</text>
+  </g>
+  <text x="340" y="506" font-size="12" fill="#1b2b3a">Not a short: R2 + R3 = 20k between 3V3 and GND,</text>
+  <text x="340" y="522" font-size="12" fill="#1b2b3a">so only about 0.17 mA flows. C1 blocks DC between A and B.</text>
+</svg>
