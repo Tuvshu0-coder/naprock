@@ -224,6 +224,7 @@ static size_t recCapacity = 0;
 static volatile size_t recCount = 0;
 static volatile bool recRunning = false;
 static volatile bool recStopRequested = false;
+static volatile bool recRestart = false;     // throw away what was captured so far and start counting again
 static volatile bool recReady = false;       // the recording task has the ADC running
 static volatile bool recOpenFailed = false;  // the recording task could not start the ADC
 static volatile uint16_t recLevel = 0;  // peak-to-peak counts over the last 100 ms, for the level meter
@@ -1071,6 +1072,15 @@ static void recordTask(void *) {
   int16_t levelMax = 0;
   size_t levelSamples = 0;
   while (!recStopRequested && recCount < recCapacity) {
+    if (recRestart) {
+      // The LISTENING box has only just appeared: the recording starts now, not when + was pressed.
+      recRestart = false;
+      recCount = 0;
+      levelSamples = 0;
+      levelMin = 4095;
+      levelMax = 0;
+    }
+    vTaskDelay(1);  // always leave time for the screen; the ADC buffers 60 ms, so nothing is missed
     size_t before = recCount;
     size_t got = adcReadSamples(recBuffer + before, recCapacity - before, 100);
     for (size_t index = 0; index < got; index++) {
@@ -1224,13 +1234,19 @@ static void beginVoiceAdd() {
     failVoice("Not connected to the bridge.");
     return;
   }
+  uint32_t pressedAt = millis();
   if (!startRecording()) {
     failVoice("Could not start recording. Not enough memory.");
     return;
   }
+  uint32_t startedAt = millis();
   voicePhase = VOICE_RECORDING;
   voiceUiAt = 0;
   showModal(MODAL_RECORDING);
+  lv_refr_now(nullptr);  // put the box on the screen before the clock starts
+  recRestart = true;
+  Serial.printf("Voice: microphone started in %lu ms, LISTENING box drawn in %lu ms; recording starts now\n",
+                (unsigned long)(startedAt - pressedAt), (unsigned long)(millis() - startedAt));
 }
 
 // Starts (or restarts) sending the compressed recording under a new session number.
